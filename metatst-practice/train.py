@@ -14,6 +14,8 @@ from src.model import MetaForecastTransformer
 
 @dataclass
 class TrainConfig:
+    """Experiment settings for the starter training loop."""
+
     context_length: int = 48
     prediction_length: int = 24
     num_series: int = 256
@@ -25,12 +27,16 @@ class TrainConfig:
 
 
 def set_seed(seed: int) -> None:
+    """Keep runs reproducible enough for debugging and basic comparisons."""
+
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
 def build_loaders(config: TrainConfig) -> dict[str, DataLoader]:
+    """Build train/validation/test loaders from the same synthetic recipe."""
+
     common = {
         "num_series": config.num_series,
         "context_length": config.context_length,
@@ -55,6 +61,12 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> float:
+    """Run one epoch for either training or evaluation.
+
+    If `optimizer` is provided, gradients are enabled and parameters are
+    updated. Otherwise this function behaves like an evaluation loop.
+    """
+
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
@@ -66,6 +78,7 @@ def run_epoch(
         metadata_real = batch["metadata_real"].to(device)
 
         with torch.set_grad_enabled(is_train):
+            # The model predicts the full future horizon in one forward pass.
             predictions = model(past_values, metadata_categorical, metadata_real)
             loss = criterion(predictions, future_values)
             if is_train:
@@ -83,6 +96,8 @@ def save_checkpoint(
     config: TrainConfig,
     save_dir: Path,
 ) -> Path:
+    """Store the best-performing checkpoint for later inspection."""
+
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = save_dir / "metatst_transformer.pt"
     torch.save({"model_state_dict": model.state_dict(), "config": asdict(config)}, checkpoint_path)
@@ -90,6 +105,7 @@ def save_checkpoint(
 
 
 def main() -> None:
+    # Keep the CLI intentionally small for the first round of experiments.
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -104,6 +120,7 @@ def main() -> None:
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Dataset metadata schema is reused to configure the forecaster.
     loaders = build_loaders(config)
     model = MetaForecastTransformer(
         context_length=config.context_length,
@@ -133,6 +150,7 @@ def main() -> None:
                 save_dir=Path("artifacts"),
             )
 
+    # Final test loss is reported after the training loop for a quick sanity check.
     test_loss = run_epoch(model, loaders["test"], criterion, device)
     print(f"test_loss={test_loss:.4f}")
     print(f"best_checkpoint={checkpoint_path}")

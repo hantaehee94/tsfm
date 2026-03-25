@@ -7,7 +7,12 @@ from torch import nn
 
 
 class MetadataEncoder(nn.Module):
-    """Encodes categorical and real metadata into a shared dense vector."""
+    """Encodes categorical and real metadata into a shared dense vector.
+
+    The paper's central idea is that metadata can improve forecasting if we
+    expose it to the model in a structured way. This module turns mixed-type
+    metadata into one vector that the forecaster can condition on.
+    """
 
     def __init__(
         self,
@@ -18,10 +23,13 @@ class MetadataEncoder(nn.Module):
     ) -> None:
         super().__init__()
         cardinalities: List[int] = list(categorical_cardinalities)
+        # Each categorical field gets its own embedding table.
         self.categorical_embeddings = nn.ModuleList(
             [nn.Embedding(cardinality, embedding_dim) for cardinality in cardinalities]
         )
 
+        # Concatenate embedded categorical features with real-valued metadata,
+        # then project them into the model hidden size.
         input_dim = embedding_dim * len(cardinalities) + num_real_features
         self.projection = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -37,6 +45,7 @@ class MetadataEncoder(nn.Module):
         embedded = []
         for idx, embedding in enumerate(self.categorical_embeddings):
             embedded.append(embedding(metadata_categorical[:, idx]))
+
         parts = embedded + [metadata_real]
         merged = torch.cat(parts, dim=-1)
         return self.projection(merged)
