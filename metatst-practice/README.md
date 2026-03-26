@@ -3,7 +3,7 @@
 논문 "Metadata Matters for Time Series: Informative Forecasting with Transformers"를
 직접 실습해보기 위한 스타터 프로젝트입니다.
 
-이 저장소는 다음 흐름을 빠르게 확인하는 데 초점을 둡니다.
+이 저장소는 다음 흐름을 빠르게 확인하는데  초점을 둡니다.
 
 - 시계열 context window 구성
 - categorical / real metadata 인코딩
