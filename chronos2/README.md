@@ -54,10 +54,16 @@ streamlit run app.py
 ### GUI에서 할 수 있는 일
 
 - 합성 시계열 예제로 바로 예측 실행
-- `context_df`, `future_df` 파일 업로드
+- 미래 공변량 사용 여부를 켜고 끄며 비교 실험
+- `context_df` 업로드만으로도 예측 실행
+- 필요할 때만 `future_df` 파일 업로드
+- `id`가 없는 단일 시계열도 자동 단일 시계열 모드로 실행
+- 타임스탬프 시작/종료 구간을 인덱스로 선택
+- 입력한 시작/종료 인덱스에 대응하는 실제 타임스탬프 확인
+- 데이터셋 내부 평가 모드와 선택 구간 끝 미래 예측 모드 지원
 - `id`, `timestamp`, `target` 컬럼 선택
 - 예측 결과 표 확인
-- 특정 시계열 하나를 골라 간단한 선 그래프로 확인
+- 특정 시계열 하나를 Plotly 그래프로 더 부드럽게 확인
 - 결과 CSV 다운로드
 
 ## 추천 사용 흐름
@@ -66,8 +72,13 @@ streamlit run app.py
 
 1. GUI 실행
 2. `합성 예제`로 먼저 동작 확인
-3. 결과가 잘 나오면 실제 `context_df`, `future_df` 업로드
-4. 컬럼 매핑만 지정해서 예측 실행
+3. 미래 공변량 없이 한 번 실행
+4. 미래 공변량을 넣어 다시 실행
+5. 실제 데이터 업로드 후 `id`, `timestamp`, `target` 확인
+6. `구간 확인용 시계열`을 고르고 시작/종료 인덱스 입력
+7. 인덱스에 대응하는 실제 타임스탬프를 확인
+8. `데이터셋 내부 평가` 모드로 먼저 비교 실험
+9. 필요할 때 `선택 구간 끝에서 미래 예측` 모드 사용
 
 처음 실행 시 Hugging Face에서 `amazon/chronos-2` 모델이 다운로드됩니다.
 모델 크기는 대략 478MB 수준이라 네트워크와 디스크 여유 공간이 조금 필요합니다.
@@ -94,6 +105,19 @@ pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cpu"
 pred_df = pipeline.predict_df(
     context_df,
     future_df=future_df,
+    prediction_length=24,
+    quantile_levels=[0.1, 0.5, 0.9],
+    id_column="id",
+    timestamp_column="timestamp",
+    target="target",
+)
+```
+
+미래 공변량을 모르는 경우에는 `future_df` 없이도 바로 예측할 수 있습니다.
+
+```python
+pred_df = pipeline.predict_df(
+    context_df,
     prediction_length=24,
     quantile_levels=[0.1, 0.5, 0.9],
     id_column="id",
@@ -136,6 +160,11 @@ series_00 2024-01-05 01:00:00  106.0        0
 ...
 ```
 
+`future_df`는 선택입니다. 따라서 아래 두 상황을 모두 비교할 수 있습니다.
+
+- 미래 공변량 없이 예측
+- 미래 공변량을 함께 넣고 예측
+
 ## 자주 바꾸는 옵션
 
 ```bash
@@ -160,15 +189,17 @@ CLI를 계속 쓸 경우에는 `run_forecast.py`에서 `build_example_frames()` 
 
 핵심 조건은 아래와 같습니다.
 
-- `context_df`에 `id`, `timestamp`, `target`이 있어야 함
+- `context_df`에 `timestamp`, `target`이 있어야 함
+- `id`가 없고 단일 시계열이라면 GUI에서 자동 생성 가능
 - covariate를 쓸 경우 과거 공변량은 `context_df`에 포함
-- 미래에 이미 아는 공변량은 `future_df`에 포함
-- `prediction_length`와 `future_df` 길이가 맞아야 함
+- 미래에 이미 아는 공변량이 있을 때만 `future_df`에 포함
+- `future_df`를 쓸 경우 `prediction_length`와 `future_df` 길이가 맞아야 함
 
 예를 들어:
 
 - `context_df`: 과거 실제값 + 과거 공변량
 - `future_df`: 미래 시점 + 미래에 이미 아는 공변량
+- 미래 공변량이 없으면 `future_df` 없이 실행 가능
 
 형태만 맞으면 GUI에서 컬럼을 선택해서 바로 Chronos-2에 넣을 수 있습니다.
 

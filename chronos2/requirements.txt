@@ -1,3 +1,4 @@
 chronos-forecasting>=2.0,<3.0
 pandas[pyarrow]>=2.2,<3.0
+plotly>=5.24,<7.0
 streamlit>=1.44,<2.0
