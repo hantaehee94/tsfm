@@ -1,6 +1,7 @@
 # Chronos-2 Minimal Setup
 
 `chronos2/`는 로컬에서 Chronos-2 시계열 파운데이션 모델을 빠르게 실험해보기 위한 최소 구성 폴더입니다.
+CLI로 바로 돌릴 수도 있고, 맥북에서 혼자 쓰기 좋은 아주 단순한 GUI로도 실행할 수 있습니다.
 
 이 폴더는 아래 목표에만 집중합니다.
 
@@ -13,11 +14,15 @@
 ```text
 chronos2/
   README.md
+  app.py
+  chronos2_core.py
   requirements.txt
   run_forecast.py
 ```
 
 - `requirements.txt`: Chronos-2 추론에 필요한 최소 패키지 목록
+- `app.py`: Streamlit 기반 로컬 GUI
+- `chronos2_core.py`: CLI와 GUI가 같이 쓰는 공통 예측 함수
 - `run_forecast.py`: 합성 시계열 데이터를 만들고 Chronos-2로 예측하는 실행 예제
 
 ## 빠른 시작
@@ -30,6 +35,39 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python run_forecast.py
 ```
+
+## GUI 실행
+
+배포 없이 내 맥북에서만 간단히 쓰려면 GUI 쪽이 더 편합니다.
+
+```bash
+cd /Users/taehee/tsfm/chronos2
+source .venv/bin/activate
+streamlit run app.py
+```
+
+브라우저가 열리면 아래 두 방식 중 하나로 실험하면 됩니다.
+
+1. `합성 예제`
+2. `파일 업로드`
+
+### GUI에서 할 수 있는 일
+
+- 합성 시계열 예제로 바로 예측 실행
+- `context_df`, `future_df` 파일 업로드
+- `id`, `timestamp`, `target` 컬럼 선택
+- 예측 결과 표 확인
+- 특정 시계열 하나를 골라 간단한 선 그래프로 확인
+- 결과 CSV 다운로드
+
+## 추천 사용 흐름
+
+처음에는 아래 순서가 가장 편합니다.
+
+1. GUI 실행
+2. `합성 예제`로 먼저 동작 확인
+3. 결과가 잘 나오면 실제 `context_df`, `future_df` 업로드
+4. 컬럼 매핑만 지정해서 예측 실행
 
 처음 실행 시 Hugging Face에서 `amazon/chronos-2` 모델이 다운로드됩니다.
 모델 크기는 대략 478MB 수준이라 네트워크와 디스크 여유 공간이 조금 필요합니다.
@@ -54,7 +92,7 @@ from chronos import Chronos2Pipeline
 
 pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
 pred_df = pipeline.predict_df(
-    context_df=context_df,
+    context_df,
     future_df=future_df,
     prediction_length=24,
     quantile_levels=[0.1, 0.5, 0.9],
@@ -117,8 +155,8 @@ python run_forecast.py --output outputs/chronos2_exp1.parquet
 
 ## 실제 데이터로 바꾸려면
 
-합성 데이터 대신 실제 CSV/Parquet 데이터를 쓰려면 `run_forecast.py`에서
-`build_example_frames()` 부분만 교체하면 됩니다.
+GUI를 쓸 때는 코드를 바꿀 필요 없이 파일 업로드로 바로 실험할 수 있습니다.
+CLI를 계속 쓸 경우에는 `run_forecast.py`에서 `build_example_frames()` 부분만 교체하면 됩니다.
 
 핵심 조건은 아래와 같습니다.
 
@@ -126,6 +164,24 @@ python run_forecast.py --output outputs/chronos2_exp1.parquet
 - covariate를 쓸 경우 과거 공변량은 `context_df`에 포함
 - 미래에 이미 아는 공변량은 `future_df`에 포함
 - `prediction_length`와 `future_df` 길이가 맞아야 함
+
+예를 들어:
+
+- `context_df`: 과거 실제값 + 과거 공변량
+- `future_df`: 미래 시점 + 미래에 이미 아는 공변량
+
+형태만 맞으면 GUI에서 컬럼을 선택해서 바로 Chronos-2에 넣을 수 있습니다.
+
+## 로컬 전용 GUI로 충분한 이유
+
+이번 구성은 배포보다 개인 연구 생산성에 맞췄습니다.
+
+- 서버 분리 없이 `streamlit run app.py`만 실행하면 됨
+- 코드 수정 없이 파일 업로드로 실험 가능
+- 파라미터를 CLI 인자 대신 화면에서 바꿀 수 있음
+- 결과를 표와 그래프로 바로 확인 가능
+
+혼자 맥북에서 반복 실험하는 목적이라면 이 정도가 가장 가볍고 유지보수 부담도 적습니다.
 
 ## 참고
 
