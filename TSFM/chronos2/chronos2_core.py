@@ -7,6 +7,9 @@ import pandas as pd
 import torch
 from chronos import Chronos2Pipeline
 
+CHRONOS2_MAX_CONTEXT_LENGTH = 8192
+CHRONOS2_MAX_PREDICTION_LENGTH = 1024
+
 
 def detect_device() -> str:
     if torch.cuda.is_available():
@@ -66,6 +69,35 @@ def load_pipeline(model_id: str, device: str) -> Chronos2Pipeline:
     return Chronos2Pipeline.from_pretrained(model_id, device_map=device)
 
 
+def validate_chronos2_lengths(
+    prediction_length: int,
+    context_length: int | None = None,
+) -> None:
+    if prediction_length < 1:
+        raise ValueError("prediction_length는 1 이상이어야 합니다.")
+    if prediction_length > CHRONOS2_MAX_PREDICTION_LENGTH:
+        raise ValueError(
+            f"Chronos-2 공식 스펙상 prediction_length는 최대 {CHRONOS2_MAX_PREDICTION_LENGTH}까지 지원합니다."
+        )
+    if context_length is not None and context_length < 1:
+        raise ValueError("context_length는 1 이상이어야 합니다.")
+    if context_length is not None and context_length > CHRONOS2_MAX_CONTEXT_LENGTH:
+        raise ValueError(
+            f"Chronos-2 공식 스펙상 context_length는 최대 {CHRONOS2_MAX_CONTEXT_LENGTH}까지 지원합니다."
+        )
+
+
+def trim_context_to_model_limit(
+    context_df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+) -> pd.DataFrame:
+    prepared = context_df.copy()
+    prepared[timestamp_column] = pd.to_datetime(prepared[timestamp_column], errors="coerce")
+    prepared = prepared.sort_values([id_column, timestamp_column])
+    return prepared.groupby(id_column, group_keys=False).tail(CHRONOS2_MAX_CONTEXT_LENGTH)
+
+
 def run_prediction(
     pipeline: Chronos2Pipeline,
     context_df: pd.DataFrame,
@@ -76,11 +108,16 @@ def run_prediction(
     target_column: str,
     quantile_levels: list[float] | None = None,
 ) -> pd.DataFrame:
+    validate_chronos2_lengths(prediction_length=prediction_length)
+
     if quantile_levels is None:
         quantile_levels = [0.1, 0.5, 0.9]
 
-    prepared_context = context_df.copy()
-    prepared_context[timestamp_column] = pd.to_datetime(prepared_context[timestamp_column])
+    prepared_context = trim_context_to_model_limit(
+        context_df=context_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+    )
     prepared_future = None
     if future_df is not None and not future_df.empty:
         prepared_future = future_df.copy()

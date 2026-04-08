@@ -4,10 +4,13 @@ import argparse
 from pathlib import Path
 
 from chronos2_core import (
+    CHRONOS2_MAX_CONTEXT_LENGTH,
+    CHRONOS2_MAX_PREDICTION_LENGTH,
     build_example_frames,
     detect_device,
     load_pipeline,
     run_prediction,
+    validate_chronos2_lengths,
 )
 
 
@@ -24,13 +27,13 @@ def main() -> None:
         "--context-length",
         type=int,
         default=96,
-        help="Number of historical steps per series.",
+        help=f"Number of historical steps per series (max {CHRONOS2_MAX_CONTEXT_LENGTH}).",
     )
     parser.add_argument(
         "--prediction-length",
         type=int,
         default=24,
-        help="Number of future steps to forecast.",
+        help=f"Number of future steps to forecast (max {CHRONOS2_MAX_PREDICTION_LENGTH}).",
     )
     parser.add_argument(
         "--num-series",
@@ -45,6 +48,11 @@ def main() -> None:
         help="Path to save the forecast dataframe.",
     )
     args = parser.parse_args()
+
+    validate_chronos2_lengths(
+        context_length=args.context_length,
+        prediction_length=args.prediction_length,
+    )
 
     device = detect_device()
     print(f"Loading {args.model_id} on device={device}")
