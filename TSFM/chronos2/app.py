@@ -26,6 +26,7 @@ st.caption("맥북에서 로컬로 Chronos-2 예측 실험을 빠르게 돌리�
 
 AUTO_ID_OPTION = "__single_series__"
 AUTO_ID_COLUMN = "__auto_id__"
+WEEKDAY_COVARIATE_COLUMN = "__weekday__"
 
 
 @st.cache_resource(show_spinner=False)
@@ -114,6 +115,27 @@ def filter_model_columns(
     keep_future_columns = [col for col in future_df.columns if col not in past_covariates]
     prepared_future = future_df.loc[:, keep_future_columns].copy()
     return prepared_context, prepared_full_context, prepared_future
+
+
+def add_weekday_covariate(
+    context_df: pd.DataFrame,
+    future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    prepared_context = context_df.copy()
+    prepared_context[timestamp_column] = pd.to_datetime(prepared_context[timestamp_column], errors="coerce")
+    prepared_context[WEEKDAY_COVARIATE_COLUMN] = prepared_context[timestamp_column].dt.day_name()
+
+    if future_df is not None and not future_df.empty:
+        prepared_future = future_df.copy()
+        prepared_future[timestamp_column] = pd.to_datetime(prepared_future[timestamp_column], errors="coerce")
+        prepared_future[WEEKDAY_COVARIATE_COLUMN] = prepared_future[timestamp_column].dt.day_name()
+        return prepared_context, prepared_future
+
+    derived_future = prepared_context[[id_column, timestamp_column]].drop_duplicates().copy()
+    derived_future[WEEKDAY_COVARIATE_COLUMN] = derived_future[timestamp_column].dt.day_name()
+    return prepared_context, derived_future
 
 
 def trim_by_index_window(
@@ -639,6 +661,38 @@ def run_sliding_window_validation(
     return summary_df, windows_df
 
 
+def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> pd.DataFrame:
+    metric_columns = ["MAE", "RMSE", "MAPE", "MASE", "Correlation"]
+    if validation_windows_df.empty or "scenario" not in validation_windows_df.columns:
+        return pd.DataFrame()
+
+    grouped = validation_windows_df.groupby("scenario", dropna=False)[metric_columns].mean().reset_index()
+    if set(grouped["scenario"]) != {"요일 미사용", "요일 사용"}:
+        return grouped
+
+    baseline = grouped.loc[grouped["scenario"] == "요일 미사용"].iloc[0]
+    weekday = grouped.loc[grouped["scenario"] == "요일 사용"].iloc[0]
+    comparison_rows: list[dict[str, object]] = []
+
+    for metric in metric_columns:
+        delta = float(weekday[metric] - baseline[metric])
+        if metric == "Correlation":
+            better = "개선" if delta > 0 else "악화" if delta < 0 else "동일"
+        else:
+            better = "개선" if delta < 0 else "악화" if delta > 0 else "동일"
+        comparison_rows.append(
+            {
+                "metric": metric,
+                "요일 미사용": float(baseline[metric]),
+                "요일 사용": float(weekday[metric]),
+                "delta": delta,
+                "판정": better,
+            }
+        )
+
+    return pd.DataFrame(comparison_rows)
+
+
 with st.sidebar:
     st.header("실험 설정")
     page_mode = st.radio(
@@ -980,6 +1034,11 @@ elif page_mode == "자동 검증":
         step=1,
     )
     max_windows = None if int(max_windows_input) == 0 else int(max_windows_input)
+    compare_weekday_covariate = st.checkbox(
+        "요일 categorical covariate A/B 비교",
+        value=False,
+        help="timestamp에서 요일을 자동 생성해 `요일 미사용`과 `요일 사용` 검증 결과를 함께 비교합니다.",
+    )
 
     if st.button("슬라이딩 윈도우 검증 실행", type="primary", disabled=not can_run):
         try:
@@ -997,17 +1056,55 @@ elif page_mode == "자동 검증":
                     stride=int(validation_stride),
                     max_windows=max_windows,
                 )
+                summary_df = summary_df.copy()
+                windows_df = windows_df.copy()
+                summary_df["scenario"] = "요일 미사용"
+                windows_df["scenario"] = "요일 미사용"
+
+                comparison_summary_df = pd.DataFrame()
+                if compare_weekday_covariate:
+                    weekday_context_df, weekday_future_df = add_weekday_covariate(
+                        context_df=context_df,
+                        future_df=future_df,
+                        id_column=id_column,
+                        timestamp_column=timestamp_column,
+                    )
+                    weekday_summary_df, weekday_windows_df = run_sliding_window_validation(
+                        pipeline=pipeline,
+                        context_df=weekday_context_df,
+                        future_df=weekday_future_df,
+                        id_column=id_column,
+                        timestamp_column=timestamp_column,
+                        target_column=target_column,
+                        context_length=int(validation_context_length),
+                        prediction_length=int(validation_prediction_length),
+                        stride=int(validation_stride),
+                        max_windows=max_windows,
+                    )
+                    weekday_summary_df = weekday_summary_df.copy()
+                    weekday_windows_df = weekday_windows_df.copy()
+                    weekday_summary_df["scenario"] = "요일 사용"
+                    weekday_windows_df["scenario"] = "요일 사용"
+                    summary_df = pd.concat([summary_df, weekday_summary_df], ignore_index=True)
+                    windows_df = pd.concat([windows_df, weekday_windows_df], ignore_index=True)
+                    comparison_summary_df = build_validation_comparison_summary(windows_df)
+
                 st.session_state["validation_summary_df"] = summary_df
                 st.session_state["validation_windows_df"] = windows_df
+                st.session_state["validation_comparison_summary_df"] = comparison_summary_df
             st.success("자동 검증이 완료되었습니다.")
         except Exception as exc:
             st.error(f"자동 검증 중 오류가 발생했습니다: {exc}")
 
     validation_summary_df = st.session_state.get("validation_summary_df")
     validation_windows_df = st.session_state.get("validation_windows_df")
+    validation_comparison_summary_df = st.session_state.get("validation_comparison_summary_df")
     if isinstance(validation_summary_df, pd.DataFrame) and not validation_summary_df.empty:
         st.markdown("**검증 요약**")
         st.dataframe(validation_summary_df, use_container_width=True)
+    if isinstance(validation_comparison_summary_df, pd.DataFrame) and not validation_comparison_summary_df.empty:
+        st.markdown("**요일 covariate 비교**")
+        st.dataframe(validation_comparison_summary_df, use_container_width=True)
     if isinstance(validation_windows_df, pd.DataFrame) and not validation_windows_df.empty:
         st.markdown("**window별 결과**")
         st.dataframe(validation_windows_df, use_container_width=True)
@@ -1017,15 +1114,29 @@ elif page_mode == "자동 검증":
             index=0,
         )
         trend_fig = go.Figure()
-        trend_fig.add_trace(
-            go.Scatter(
-                x=validation_windows_df["window_index"],
-                y=validation_windows_df[metric_for_plot],
-                mode="lines+markers",
-                name=metric_for_plot,
-                line={"color": "#1d3557", "width": 2},
+        if "scenario" in validation_windows_df.columns:
+            line_colors = {"요일 미사용": "#1d3557", "요일 사용": "#e76f51"}
+            for scenario_name, group in validation_windows_df.groupby("scenario", dropna=False):
+                group = group.sort_values("window_index")
+                trend_fig.add_trace(
+                    go.Scatter(
+                        x=group["window_index"],
+                        y=group[metric_for_plot],
+                        mode="lines+markers",
+                        name=str(scenario_name),
+                        line={"color": line_colors.get(str(scenario_name), "#457b9d"), "width": 2},
+                    )
+                )
+        else:
+            trend_fig.add_trace(
+                go.Scatter(
+                    x=validation_windows_df["window_index"],
+                    y=validation_windows_df[metric_for_plot],
+                    mode="lines+markers",
+                    name=metric_for_plot,
+                    line={"color": "#1d3557", "width": 2},
+                )
             )
-        )
         trend_fig.update_layout(
             height=360,
             margin={"l": 20, "r": 20, "t": 30, "b": 20},
