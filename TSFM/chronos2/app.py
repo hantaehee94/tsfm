@@ -693,31 +693,65 @@ def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> 
     return pd.DataFrame(comparison_rows)
 
 
+def show_top_status(
+    source_mode: str,
+    context_df: pd.DataFrame,
+    prediction_length: int,
+    device: str,
+    id_column: str,
+    timestamp_column: str,
+) -> None:
+    series_count = 0
+    if not context_df.empty and id_column and timestamp_column:
+        series_count = int(get_series_lengths(context_df, id_column, timestamp_column).shape[0])
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("데이터 소스", source_mode)
+    col2.metric("시계열 수", series_count)
+    col3.metric("예측 구간 길이", int(prediction_length))
+    col4.metric("실행 장치", device)
+
+
+def show_metric_cards(metrics_df: pd.DataFrame) -> None:
+    if metrics_df.empty:
+        return
+    metric_names = ["MAE", "RMSE", "MAPE", "MASE", "Correlation"]
+    columns = st.columns(len(metric_names))
+    row = metrics_df.iloc[0]
+    for column, metric_name in zip(columns, metric_names):
+        value = row.get(metric_name)
+        display = "-" if pd.isna(value) else f"{float(value):.4f}"
+        column.metric(metric_name, display)
+
+
+def show_validation_cards(summary_df: pd.DataFrame) -> None:
+    if summary_df.empty:
+        return
+    row = summary_df.iloc[0]
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("윈도우 수", int(row["windows"]))
+    col2.metric("평균 MAE", f"{float(row['MAE_mean']):.4f}")
+    col3.metric("평균 RMSE", f"{float(row['RMSE_mean']):.4f}")
+    col4.metric("평균 MASE", f"{float(row['MASE_mean']):.4f}")
+
+
 with st.sidebar:
-    st.header("실험 설정")
-    page_mode = st.radio(
-        "작업 화면",
-        options=["단일 예측", "자동 검증", "공변량 분석"],
-        index=0,
+    st.header("빠른 안내")
+    st.caption("Forecast, Validation, Covariate Lab 탭에서 실험을 이어갈 수 있습니다.")
+    st.markdown(
+        "- 과거 데이터는 필수입니다.\n"
+        "- 미래 공변량은 선택입니다.\n"
+        "- `id`가 없으면 단일 시계열로 자동 생성할 수 있습니다.\n"
+        f"- Chronos-2 입력 history는 시계열당 최대 {CHRONOS2_MAX_CONTEXT_LENGTH}개입니다."
     )
-    model_id = st.text_input("모델 ID", value="amazon/chronos-2")
-    device_options = []
-    for candidate in [detect_device(), "cpu", "mps", "cuda"]:
-        if candidate not in device_options:
-            device_options.append(candidate)
-    device = st.selectbox(
-        "실행 장치",
-        options=device_options,
-        index=0,
-    )
-    prediction_length = st.number_input(
-        "예측 길이",
-        min_value=1,
-        max_value=CHRONOS2_MAX_PREDICTION_LENGTH,
-        value=24,
-        step=1,
-    )
-    source_mode = st.radio("데이터 소스", options=["합성 예제", "파일 업로드"], index=0)
+    st.markdown("**입력 형식 힌트**")
+    st.code("과거 데이터: id, timestamp, target, covariates...", language="text")
+    st.code("미래 공변량: id, timestamp, known_covariates...", language="text")
+
+device_options = []
+for candidate in [detect_device(), "cpu", "mps", "cuda"]:
+    if candidate not in device_options:
+        device_options.append(candidate)
 
 context_df = pd.DataFrame()
 full_context_df = pd.DataFrame()
@@ -727,318 +761,404 @@ timestamp_column = ""
 target_column = ""
 experiment_mode = "선택 구간 끝에서 미래 예측"
 
-with st.expander("데이터 준비", expanded=True):
-    if source_mode == "합성 예제":
-        st.subheader("합성 데이터 실험")
-        col1, col2 = st.columns(2)
-        with col1:
-            num_series = st.number_input("시계열 개수", min_value=1, max_value=50, value=3, step=1)
-        with col2:
-            context_length = st.number_input(
-                "과거 길이",
-                min_value=8,
-                max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
-                value=96,
-                step=8,
-            )
-        use_future_covariates = st.checkbox("미래 공변량 사용", value=True)
+default_prediction_length = int(st.session_state.get("prediction_length_input", 24))
+default_model_id = str(st.session_state.get("model_id_input", "amazon/chronos-2"))
+default_device = str(st.session_state.get("device_input", device_options[0]))
+default_source_mode = str(st.session_state.get("source_mode_input", "합성 예제"))
 
-        context_df, generated_future_df = build_example_frames(
-            num_series=int(num_series),
-            context_length=int(context_length),
-            prediction_length=int(prediction_length),
+st.markdown("로컬에서 예측, 검증, 공변량 실험을 빠르게 반복하는 시계열 워크벤치")
+
+global_settings = st.container(border=True)
+with global_settings:
+    st.markdown("**전역 설정**")
+    setting_col1, setting_col2, setting_col3, setting_col4 = st.columns([2, 1, 1, 1])
+    with setting_col1:
+        model_id = st.text_input("모델 ID", value=default_model_id, key="model_id_input")
+    with setting_col2:
+        device_index = device_options.index(default_device) if default_device in device_options else 0
+        device = st.selectbox("실행 장치", options=device_options, index=device_index, key="device_input")
+    with setting_col3:
+        prediction_length = st.number_input(
+            "예측 구간 길이",
+            min_value=1,
+            max_value=CHRONOS2_MAX_PREDICTION_LENGTH,
+            value=default_prediction_length,
+            step=1,
+            key="prediction_length_input",
         )
-        full_context_df = context_df.copy()
-        future_df = generated_future_df if use_future_covariates else None
-        id_column = "id"
-        timestamp_column = "timestamp"
-        target_column = "target"
-
-        if use_future_covariates:
-            st.markdown("`run_forecast.py`와 같은 합성 데이터와 미래 공변량으로 예측을 실행합니다.")
-        else:
-            st.markdown("합성 데이터의 과거 구간만 사용해서, 미래 공변량 없이 예측을 실행합니다.")
-    else:
-        st.subheader("파일 업로드 실험")
-        st.markdown("`context_df`는 필수이고, `future_df`는 선택입니다. 지원 형식은 CSV, Parquet입니다.")
-
-        context_file = st.file_uploader("과거 데이터 context_df", type=["csv", "parquet"])
-        future_file = st.file_uploader("미래 공변량 future_df (선택)", type=["csv", "parquet"])
-
-        if context_file:
-            context_df = load_table(context_file.name, context_file.getvalue())
-            full_context_df = context_df.copy()
-            if future_file:
-                future_df = load_table(future_file.name, future_file.getvalue())
-            guessed_id_column = guess_id_column(context_df)
-            guessed_timestamp_column = guess_timestamp_column(context_df)
-            guessed_target_column = guess_target_column(context_df)
-
-            id_options = [AUTO_ID_OPTION, *context_df.columns.tolist()]
-            id_index = 0 if guessed_id_column == AUTO_ID_OPTION else context_df.columns.get_loc(guessed_id_column) + 1
-
-            meta1, meta2, meta3 = st.columns(3)
-            with meta1:
-                id_column = st.selectbox(
-                    "id 컬럼",
-                    options=id_options,
-                    index=id_index,
-                    format_func=lambda value: "단일 시계열로 자동 생성" if value == AUTO_ID_OPTION else value,
-                )
-            with meta2:
-                timestamp_column = st.selectbox(
-                    "timestamp 컬럼",
-                    options=context_df.columns,
-                    index=context_df.columns.get_loc(guessed_timestamp_column),
-                )
-            with meta3:
-                target_column = st.selectbox(
-                    "target 컬럼",
-                    options=context_df.columns,
-                    index=context_df.columns.get_loc(guessed_target_column),
-                )
-
-            context_df, future_df, id_column = apply_id_selection(
-                context_df=context_df,
-                future_df=future_df,
-                id_selection=id_column,
-            )
-            full_context_df = context_df.copy()
-
-            available_past_covariates = [
-                col
-                for col in context_df.columns
-                if col not in {id_column, timestamp_column, target_column}
-            ]
-            selected_past_covariates = st.multiselect(
-                "past covariates로 사용할 컬럼",
-                options=available_past_covariates,
-                default=[],
-            )
-            context_df, full_context_df, future_df = filter_model_columns(
-                context_df=context_df,
-                full_context_df=full_context_df,
-                future_df=future_df,
-                id_column=id_column,
-                timestamp_column=timestamp_column,
-                target_column=target_column,
-                past_covariates=selected_past_covariates,
-            )
-
-            lengths = get_series_lengths(context_df, id_column=id_column, timestamp_column=timestamp_column)
-            inspect_ids = context_df[id_column].astype(str).drop_duplicates().tolist()
-            inspect_id = st.selectbox("구간 확인용 시계열", options=inspect_ids)
-            inspect_timestamps = get_index_timestamp_map(
-                df=context_df,
-                id_column=id_column,
-                timestamp_column=timestamp_column,
-                selected_id=inspect_id,
-            )
-
-            st.markdown("**타임스탬프 요약**")
-            info1, info2, info3 = st.columns(3)
-            info1.metric("전체 시작", str(inspect_timestamps.iloc[0]))
-            info2.metric("전체 종료", str(inspect_timestamps.iloc[-1]))
-            info3.metric("전체 길이", int(len(inspect_timestamps)))
-
-            shared_length = int(lengths.min())
-            range_col1, range_col2 = st.columns(2)
-            with range_col1:
-                start_idx = st.number_input("시작 인덱스", min_value=0, max_value=shared_length - 1, value=0, step=1)
-            with range_col2:
-                end_idx = st.number_input(
-                    "종료 인덱스",
-                    min_value=int(start_idx),
-                    max_value=shared_length - 1,
-                    value=shared_length - 1,
-                    step=1,
-                )
-
-            ts_col1, ts_col2 = st.columns(2)
-            ts_col1.info(f"시작 타임스탬프: {inspect_timestamps.iloc[int(start_idx)]}")
-            ts_col2.info(f"종료 타임스탬프: {inspect_timestamps.iloc[int(end_idx)]}")
-
-            experiment_mode = st.radio(
-                "실험 모드",
-                options=["데이터셋 내부 평가", "선택 구간 끝에서 미래 예측"],
-                index=0,
-            )
-
-            context_df = trim_by_index_window(
-                df=context_df,
-                id_column=id_column,
-                timestamp_column=timestamp_column,
-                start_idx=int(start_idx),
-                end_idx=int(end_idx),
-            )
-
-actual_future_df = None
-
-if not context_df.empty:
-    series_lengths = get_series_lengths(context_df, id_column=id_column, timestamp_column=timestamp_column)
-    if int(series_lengths.max()) > CHRONOS2_MAX_CONTEXT_LENGTH:
-        st.warning(
-            "Chronos-2 공식 스펙에 맞추기 위해 각 시계열의 최근 "
-            f"{CHRONOS2_MAX_CONTEXT_LENGTH}개 시점만 모델 입력에 사용합니다."
+    with setting_col4:
+        source_mode = st.radio(
+            "데이터 소스",
+            options=["합성 예제", "파일 업로드"],
+            index=0 if default_source_mode == "합성 예제" else 1,
+            key="source_mode_input",
         )
-    preview1, preview2 = st.columns(2)
-    with preview1:
-        show_context_summary(
+
+tabs = st.tabs(["Forecast", "Validation", "Covariate Lab"])
+
+with tabs[0]:
+    st.subheader("Forecast")
+    st.caption("단일 예측을 실행하고 결과를 빠르게 확인합니다.")
+
+    prep_col, inspect_col = st.columns([1.05, 1.15])
+    with prep_col:
+        with st.container(border=True):
+            st.markdown("**1. 데이터 준비**")
+            if source_mode == "합성 예제":
+                synthetic_col1, synthetic_col2 = st.columns(2)
+                with synthetic_col1:
+                    num_series = st.number_input("시계열 개수", min_value=1, max_value=50, value=3, step=1)
+                with synthetic_col2:
+                    context_length = st.number_input(
+                        "과거 길이",
+                        min_value=8,
+                        max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
+                        value=96,
+                        step=8,
+                    )
+                use_future_covariates = st.checkbox("미래 공변량 사용", value=True)
+
+                context_df, generated_future_df = build_example_frames(
+                    num_series=int(num_series),
+                    context_length=int(context_length),
+                    prediction_length=int(prediction_length),
+                )
+                full_context_df = context_df.copy()
+                future_df = generated_future_df if use_future_covariates else None
+                id_column = "id"
+                timestamp_column = "timestamp"
+                target_column = "target"
+
+                if use_future_covariates:
+                    st.caption("합성 데이터와 미래 공변량을 함께 사용해 예측합니다.")
+                else:
+                    st.caption("합성 데이터의 과거 구간만 사용해 미래 공변량 없이 예측합니다.")
+            else:
+                st.caption("과거 데이터는 필수이고, 미래 공변량은 선택입니다. CSV와 Parquet를 지원합니다.")
+                context_file = st.file_uploader("과거 데이터", type=["csv", "parquet"])
+                future_file = st.file_uploader("미래 공변량", type=["csv", "parquet"])
+
+                if context_file:
+                    context_df = load_table(context_file.name, context_file.getvalue())
+                    full_context_df = context_df.copy()
+                    if future_file:
+                        future_df = load_table(future_file.name, future_file.getvalue())
+
+    with inspect_col:
+        with st.container(border=True):
+            st.markdown("**2. 입력 확인**")
+            if source_mode == "파일 업로드" and not context_df.empty:
+                st.markdown("스키마 매핑")
+                guessed_id_column = guess_id_column(context_df)
+                guessed_timestamp_column = guess_timestamp_column(context_df)
+                guessed_target_column = guess_target_column(context_df)
+
+                id_options = [AUTO_ID_OPTION, *context_df.columns.tolist()]
+                id_index = 0 if guessed_id_column == AUTO_ID_OPTION else context_df.columns.get_loc(guessed_id_column) + 1
+
+                meta1, meta2, meta3 = st.columns(3)
+                with meta1:
+                    id_column = st.selectbox(
+                        "시계열 ID 컬럼",
+                        options=id_options,
+                        index=id_index,
+                        format_func=lambda value: "단일 시계열로 자동 생성" if value == AUTO_ID_OPTION else value,
+                    )
+                with meta2:
+                    timestamp_column = st.selectbox(
+                        "시간 컬럼",
+                        options=context_df.columns,
+                        index=context_df.columns.get_loc(guessed_timestamp_column),
+                    )
+                with meta3:
+                    target_column = st.selectbox(
+                        "타깃 컬럼",
+                        options=context_df.columns,
+                        index=context_df.columns.get_loc(guessed_target_column),
+                    )
+
+                context_df, future_df, id_column = apply_id_selection(
+                    context_df=context_df,
+                    future_df=future_df,
+                    id_selection=id_column,
+                )
+                full_context_df = context_df.copy()
+
+                available_past_covariates = [
+                    col for col in context_df.columns if col not in {id_column, timestamp_column, target_column}
+                ]
+                selected_past_covariates = st.multiselect(
+                    "과거 공변량",
+                    options=available_past_covariates,
+                    default=[],
+                )
+                context_df, full_context_df, future_df = filter_model_columns(
+                    context_df=context_df,
+                    full_context_df=full_context_df,
+                    future_df=future_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    target_column=target_column,
+                    past_covariates=selected_past_covariates,
+                )
+
+                st.markdown("분석 구간 선택")
+                lengths = get_series_lengths(context_df, id_column=id_column, timestamp_column=timestamp_column)
+                inspect_ids = context_df[id_column].astype(str).drop_duplicates().tolist()
+                inspect_id = st.selectbox("확인용 시계열", options=inspect_ids)
+                inspect_timestamps = get_index_timestamp_map(
+                    df=context_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    selected_id=inspect_id,
+                )
+
+                info1, info2, info3 = st.columns(3)
+                info1.metric("전체 시작", str(inspect_timestamps.iloc[0]))
+                info2.metric("전체 종료", str(inspect_timestamps.iloc[-1]))
+                info3.metric("전체 길이", int(len(inspect_timestamps)))
+
+                shared_length = int(lengths.min())
+                range_col1, range_col2 = st.columns(2)
+                with range_col1:
+                    start_idx = st.number_input("시작 인덱스", min_value=0, max_value=shared_length - 1, value=0, step=1)
+                with range_col2:
+                    end_idx = st.number_input(
+                        "종료 인덱스",
+                        min_value=int(start_idx),
+                        max_value=shared_length - 1,
+                        value=shared_length - 1,
+                        step=1,
+                    )
+
+                ts_col1, ts_col2 = st.columns(2)
+                ts_col1.info(f"시작 시점: {inspect_timestamps.iloc[int(start_idx)]}")
+                ts_col2.info(f"종료 시점: {inspect_timestamps.iloc[int(end_idx)]}")
+
+                experiment_mode = st.radio(
+                    "실험 모드",
+                    options=["데이터셋 내부 평가", "선택 구간 끝에서 미래 예측"],
+                    index=0,
+                )
+
+                context_df = trim_by_index_window(
+                    df=context_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    start_idx=int(start_idx),
+                    end_idx=int(end_idx),
+                )
+            elif source_mode == "파일 업로드":
+                st.info("과거 데이터를 업로드하면 스키마 매핑과 분석 구간 선택이 열립니다.")
+            else:
+                st.info("합성 예제는 바로 예측 가능한 형태로 준비됩니다.")
+
+    can_run = not context_df.empty
+    if can_run:
+        show_top_status(
+            source_mode=source_mode,
             context_df=context_df,
+            prediction_length=int(prediction_length),
+            device=device,
             id_column=id_column,
             timestamp_column=timestamp_column,
         )
-        st.markdown("**Context Preview**")
-        st.dataframe(context_df.head(10), use_container_width=True)
-    with preview2:
-        st.markdown("**Future Preview**")
-        if future_df is None or future_df.empty:
-            st.info("미래 공변량 없이 실행합니다.")
-        else:
-            st.dataframe(future_df.head(10), use_container_width=True)
 
-can_run = not context_df.empty
+        if int(get_series_lengths(context_df, id_column=id_column, timestamp_column=timestamp_column).max()) > CHRONOS2_MAX_CONTEXT_LENGTH:
+            st.warning(
+                "Chronos-2 공식 스펙에 맞추기 위해 각 시계열의 최근 "
+                f"{CHRONOS2_MAX_CONTEXT_LENGTH}개 시점만 모델 입력에 사용합니다."
+            )
 
-if page_mode == "단일 예측":
-    st.subheader("단일 예측")
-    if st.button("Chronos-2 예측 실행", type="primary", disabled=not can_run):
-        try:
-            with st.spinner("모델을 불러오고 예측하는 중입니다..."):
-                pipeline = get_pipeline(model_id, device)
-                model_context_df = trim_context_to_model_limit(
+        preview_col1, preview_col2 = st.columns(2)
+        with preview_col1:
+            with st.container(border=True):
+                st.markdown("**입력 컨텍스트 미리보기**")
+                show_context_summary(
                     context_df=context_df,
                     id_column=id_column,
                     timestamp_column=timestamp_column,
                 )
-                model_future_df = future_df
-                actual_future_df = None
+                st.dataframe(context_df.head(10), use_container_width=True)
+        with preview_col2:
+            with st.container(border=True):
+                st.markdown("**미래 공변량 미리보기**")
+                if future_df is None or future_df.empty:
+                    st.info("미래 공변량 없이 실행합니다.")
+                else:
+                    st.dataframe(future_df.head(10), use_container_width=True)
 
-                if source_mode == "파일 업로드" and experiment_mode == "데이터셋 내부 평가":
-                    model_context_df, actual_future_df, model_future_df = build_evaluation_split(
+    with st.container(border=True):
+        st.markdown("**3. 실행 설정**")
+        exec_col1, exec_col2, exec_col3 = st.columns(3)
+        exec_col1.metric("모델 ID", model_id)
+        exec_col2.metric("실행 장치", device)
+        exec_col3.metric("예측 구간 길이", int(prediction_length))
+
+        if st.button("Chronos-2 예측 실행", type="primary", disabled=not can_run):
+            try:
+                with st.spinner("모델을 불러오고 예측하는 중입니다..."):
+                    pipeline = get_pipeline(model_id, device)
+                    model_context_df = trim_context_to_model_limit(
                         context_df=context_df,
-                        future_df=future_df,
                         id_column=id_column,
                         timestamp_column=timestamp_column,
-                        prediction_length=int(prediction_length),
                     )
-                elif source_mode == "파일 업로드" and experiment_mode == "선택 구간 끝에서 미래 예측":
-                    actual_future_df, model_future_df = build_future_comparison_split(
-                        full_context_df=full_context_df,
-                        model_context_df=model_context_df,
-                        future_df=future_df,
+                    model_future_df = future_df
+                    actual_future_df = None
+
+                    if source_mode == "파일 업로드" and experiment_mode == "데이터셋 내부 평가":
+                        model_context_df, actual_future_df, model_future_df = build_evaluation_split(
+                            context_df=context_df,
+                            future_df=future_df,
+                            id_column=id_column,
+                            timestamp_column=timestamp_column,
+                            prediction_length=int(prediction_length),
+                        )
+                    elif source_mode == "파일 업로드" and experiment_mode == "선택 구간 끝에서 미래 예측":
+                        actual_future_df, model_future_df = build_future_comparison_split(
+                            full_context_df=full_context_df,
+                            model_context_df=model_context_df,
+                            future_df=future_df,
+                            id_column=id_column,
+                            timestamp_column=timestamp_column,
+                            prediction_length=int(prediction_length),
+                        )
+
+                    model_context_df = trim_context_to_model_limit(
+                        context_df=model_context_df,
                         id_column=id_column,
                         timestamp_column=timestamp_column,
-                        prediction_length=int(prediction_length),
                     )
 
-                model_context_df = trim_context_to_model_limit(
-                    context_df=model_context_df,
-                    id_column=id_column,
-                    timestamp_column=timestamp_column,
-                )
-
-                st.session_state["pred_df"] = run_prediction(
-                    pipeline=pipeline,
-                    context_df=model_context_df,
-                    future_df=model_future_df,
-                    prediction_length=int(prediction_length),
-                    id_column=id_column,
-                    timestamp_column=timestamp_column,
-                    target_column=target_column,
-                )
-                st.session_state["result_meta"] = {
-                    "id_column": id_column,
-                    "timestamp_column": timestamp_column,
-                    "target_column": target_column,
-                    "history_df": model_context_df,
-                    "model_future_df": model_future_df,
-                    "actual_future_df": actual_future_df,
-                }
-                if actual_future_df is not None and not actual_future_df.empty:
-                    st.session_state["metrics_df"] = compute_metrics(
-                        pred_df=st.session_state["pred_df"],
-                        history_df=model_context_df,
-                        actual_df=actual_future_df,
+                    st.session_state["pred_df"] = run_prediction(
+                        pipeline=pipeline,
+                        context_df=model_context_df,
+                        future_df=model_future_df,
+                        prediction_length=int(prediction_length),
                         id_column=id_column,
                         timestamp_column=timestamp_column,
                         target_column=target_column,
                     )
-                else:
-                    st.session_state["metrics_df"] = None
+                    st.session_state["result_meta"] = {
+                        "id_column": id_column,
+                        "timestamp_column": timestamp_column,
+                        "target_column": target_column,
+                        "history_df": model_context_df,
+                        "model_future_df": model_future_df,
+                        "actual_future_df": actual_future_df,
+                    }
+                    if actual_future_df is not None and not actual_future_df.empty:
+                        st.session_state["metrics_df"] = compute_metrics(
+                            pred_df=st.session_state["pred_df"],
+                            history_df=model_context_df,
+                            actual_df=actual_future_df,
+                            id_column=id_column,
+                            timestamp_column=timestamp_column,
+                            target_column=target_column,
+                        )
+                    else:
+                        st.session_state["metrics_df"] = None
 
-            st.success("예측이 완료되었습니다.")
-        except Exception as exc:
-            st.error(f"실행 중 오류가 발생했습니다: {exc}")
+                st.success("예측이 완료되었습니다.")
+            except Exception as exc:
+                st.error(f"실행 중 오류가 발생했습니다: {exc}")
 
     pred_df = st.session_state.get("pred_df")
     result_meta = st.session_state.get("result_meta")
     metrics_df = st.session_state.get("metrics_df")
-
     if isinstance(pred_df, pd.DataFrame) and not pred_df.empty and result_meta:
-        st.success("예측 결과가 준비되어 있습니다.")
-        if isinstance(metrics_df, pd.DataFrame) and not metrics_df.empty:
-            st.markdown("**평가 지표**")
-            st.dataframe(metrics_df, use_container_width=True)
-        show_model_input_summary(
-            context_df=result_meta["history_df"],
-            future_df=result_meta["model_future_df"],
-            id_column=result_meta["id_column"],
-            timestamp_column=result_meta["timestamp_column"],
-            target_column=result_meta["target_column"],
-        )
-        st.dataframe(pred_df.head(50), use_container_width=True)
-        show_series_preview(
-            context_df=result_meta["history_df"],
-            pred_df=pred_df,
-            actual_future_df=result_meta["actual_future_df"],
-            id_column=result_meta["id_column"],
-            timestamp_column=result_meta["timestamp_column"],
-            target_column=result_meta["target_column"],
-        )
-        save_predictions_download(pred_df)
+        with st.container(border=True):
+            st.markdown("**4. 결과 요약**")
+            if isinstance(metrics_df, pd.DataFrame) and not metrics_df.empty:
+                show_metric_cards(metrics_df)
+            else:
+                st.info("실측 미래 구간이 없어서 평가 지표는 계산하지 않았습니다.")
 
-elif page_mode == "자동 검증":
-    st.subheader("자동 검증")
-    st.caption("현재 준비된 데이터 구간을 대상으로 슬라이딩 윈도우 평가를 수행합니다.")
-    val_col1, val_col2, val_col3 = st.columns(3)
-    with val_col1:
-        validation_context_length = st.number_input(
-            "검증 context length",
-            min_value=8,
-            max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
-            value=min(168, CHRONOS2_MAX_CONTEXT_LENGTH),
-            step=8,
-        )
-    with val_col2:
-        validation_prediction_length = st.number_input(
-            "검증 prediction length",
-            min_value=1,
-            max_value=CHRONOS2_MAX_PREDICTION_LENGTH,
-            value=int(prediction_length),
-            step=1,
-        )
-    with val_col3:
-        validation_stride = st.number_input(
-            "stride",
-            min_value=1,
-            max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
-            value=1,
-            step=1,
-        )
+        with st.container(border=True):
+            st.markdown("**대표 시계열 미리보기**")
+            show_series_preview(
+                context_df=result_meta["history_df"],
+                pred_df=pred_df,
+                actual_future_df=result_meta["actual_future_df"],
+                id_column=result_meta["id_column"],
+                timestamp_column=result_meta["timestamp_column"],
+                target_column=result_meta["target_column"],
+            )
 
-    max_windows_input = st.number_input(
-        "최대 window 수 (0이면 전체)",
-        min_value=0,
-        max_value=10000,
-        value=0,
-        step=1,
+        result_col1, result_col2 = st.columns([1.25, 1.0])
+        with result_col1:
+            with st.container(border=True):
+                st.markdown("**예측 결과 테이블**")
+                st.dataframe(pred_df.head(50), use_container_width=True)
+        with result_col2:
+            with st.container(border=True):
+                show_model_input_summary(
+                    context_df=result_meta["history_df"],
+                    future_df=result_meta["model_future_df"],
+                    id_column=result_meta["id_column"],
+                    timestamp_column=result_meta["timestamp_column"],
+                    target_column=result_meta["target_column"],
+                )
+                save_predictions_download(pred_df)
+
+with tabs[1]:
+    st.subheader("Validation")
+    st.caption("현재 준비된 데이터 구간으로 슬라이딩 윈도우 검증을 수행합니다.")
+
+    show_top_status(
+        source_mode=source_mode,
+        context_df=context_df,
+        prediction_length=int(prediction_length),
+        device=device,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
     )
-    max_windows = None if int(max_windows_input) == 0 else int(max_windows_input)
-    compare_weekday_covariate = st.checkbox(
-        "요일 categorical covariate A/B 비교",
-        value=False,
-        help="timestamp에서 요일을 자동 생성해 `요일 미사용`과 `요일 사용` 검증 결과를 함께 비교합니다.",
-    )
+
+    val_cfg_col1, val_cfg_col2 = st.columns(2)
+    with val_cfg_col1:
+        with st.container(border=True):
+            st.markdown("**1. 검증 설정**")
+            validation_context_length = st.number_input(
+                "검증용 과거 길이",
+                min_value=8,
+                max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
+                value=min(168, CHRONOS2_MAX_CONTEXT_LENGTH),
+                step=8,
+            )
+            validation_prediction_length = st.number_input(
+                "검증용 예측 구간 길이",
+                min_value=1,
+                max_value=CHRONOS2_MAX_PREDICTION_LENGTH,
+                value=int(prediction_length),
+                step=1,
+            )
+            validation_stride = st.number_input(
+                "윈도우 간격",
+                min_value=1,
+                max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
+                value=1,
+                step=1,
+            )
+            max_windows_input = st.number_input(
+                "최대 윈도우 수 (0이면 전체)",
+                min_value=0,
+                max_value=10000,
+                value=0,
+                step=1,
+            )
+            max_windows = None if int(max_windows_input) == 0 else int(max_windows_input)
+    with val_cfg_col2:
+        with st.container(border=True):
+            st.markdown("**2. 비교 옵션**")
+            compare_weekday_covariate = st.checkbox(
+                "요일 공변량 A/B 비교",
+                value=False,
+                help="timestamp에서 요일을 자동 생성해 `요일 미사용`과 `요일 사용` 결과를 비교합니다.",
+            )
+            st.caption(
+                "선택하면 기본 검증 외에도 요일 정보를 categorical covariate로 추가한 시나리오를 함께 계산합니다."
+            )
 
     if st.button("슬라이딩 윈도우 검증 실행", type="primary", disabled=not can_run):
         try:
@@ -1099,68 +1219,98 @@ elif page_mode == "자동 검증":
     validation_summary_df = st.session_state.get("validation_summary_df")
     validation_windows_df = st.session_state.get("validation_windows_df")
     validation_comparison_summary_df = st.session_state.get("validation_comparison_summary_df")
+
     if isinstance(validation_summary_df, pd.DataFrame) and not validation_summary_df.empty:
-        st.markdown("**검증 요약**")
-        st.dataframe(validation_summary_df, use_container_width=True)
-    if isinstance(validation_comparison_summary_df, pd.DataFrame) and not validation_comparison_summary_df.empty:
-        st.markdown("**요일 covariate 비교**")
-        st.dataframe(validation_comparison_summary_df, use_container_width=True)
+        with st.container(border=True):
+            st.markdown("**검증 요약**")
+            base_summary_df = validation_summary_df.loc[validation_summary_df["scenario"] == "요일 미사용"]
+            if not base_summary_df.empty:
+                show_validation_cards(base_summary_df)
+            st.dataframe(validation_summary_df, use_container_width=True)
+
     if isinstance(validation_windows_df, pd.DataFrame) and not validation_windows_df.empty:
-        st.markdown("**window별 결과**")
-        st.dataframe(validation_windows_df, use_container_width=True)
-        metric_for_plot = st.selectbox(
-            "추이로 볼 지표",
-            options=["MAE", "RMSE", "MAPE", "MASE", "Correlation"],
-            index=0,
-        )
-        trend_fig = go.Figure()
-        if "scenario" in validation_windows_df.columns:
-            line_colors = {"요일 미사용": "#1d3557", "요일 사용": "#e76f51"}
-            for scenario_name, group in validation_windows_df.groupby("scenario", dropna=False):
-                group = group.sort_values("window_index")
+        with st.container(border=True):
+            st.markdown("**지표 추이**")
+            metric_for_plot = st.selectbox(
+                "추이로 볼 지표",
+                options=["MAE", "RMSE", "MAPE", "MASE", "Correlation"],
+                index=0,
+            )
+            trend_fig = go.Figure()
+            if "scenario" in validation_windows_df.columns:
+                line_colors = {"요일 미사용": "#1d3557", "요일 사용": "#e76f51"}
+                for scenario_name, group in validation_windows_df.groupby("scenario", dropna=False):
+                    group = group.sort_values("window_index")
+                    trend_fig.add_trace(
+                        go.Scatter(
+                            x=group["window_index"],
+                            y=group[metric_for_plot],
+                            mode="lines+markers",
+                            name=str(scenario_name),
+                            line={"color": line_colors.get(str(scenario_name), "#457b9d"), "width": 2},
+                        )
+                    )
+            else:
                 trend_fig.add_trace(
                     go.Scatter(
-                        x=group["window_index"],
-                        y=group[metric_for_plot],
+                        x=validation_windows_df["window_index"],
+                        y=validation_windows_df[metric_for_plot],
                         mode="lines+markers",
-                        name=str(scenario_name),
-                        line={"color": line_colors.get(str(scenario_name), "#457b9d"), "width": 2},
+                        name=metric_for_plot,
+                        line={"color": "#1d3557", "width": 2},
                     )
                 )
-        else:
-            trend_fig.add_trace(
-                go.Scatter(
-                    x=validation_windows_df["window_index"],
-                    y=validation_windows_df[metric_for_plot],
-                    mode="lines+markers",
-                    name=metric_for_plot,
-                    line={"color": "#1d3557", "width": 2},
-                )
+            trend_fig.update_layout(
+                height=360,
+                margin={"l": 20, "r": 20, "t": 30, "b": 20},
+                xaxis_title="window_index",
+                yaxis_title=metric_for_plot,
             )
-        trend_fig.update_layout(
-            height=360,
-            margin={"l": 20, "r": 20, "t": 30, "b": 20},
-            xaxis_title="window_index",
-            yaxis_title=metric_for_plot,
-        )
-        st.plotly_chart(trend_fig, use_container_width=True)
+            st.plotly_chart(trend_fig, use_container_width=True)
 
-else:
-    st.subheader("공변량 분석")
-    st.info(
-        "이 화면은 공변량 민감도 분석을 위한 자리입니다. "
-        "다음 단계로는 선택한 covariate를 shuffle/mean-fix/scale 해서 "
-        "원본 예측과 비교하는 counterfactual 분석을 붙이는 것이 가장 좋습니다."
-    )
+    detail_col1, detail_col2 = st.columns([0.9, 1.2])
+    with detail_col1:
+        if isinstance(validation_comparison_summary_df, pd.DataFrame) and not validation_comparison_summary_df.empty:
+            with st.container(border=True):
+                st.markdown("**요일 공변량 비교**")
+                st.dataframe(validation_comparison_summary_df, use_container_width=True)
+    with detail_col2:
+        if isinstance(validation_windows_df, pd.DataFrame) and not validation_windows_df.empty:
+            with st.container(border=True):
+                st.markdown("**윈도우별 검증 결과**")
+                st.dataframe(validation_windows_df, use_container_width=True)
+
+with tabs[2]:
+    st.subheader("Covariate Lab")
+    st.caption("선택한 공변량을 변형해 예측 민감도를 비교하는 실험 공간입니다. 현재는 준비 단계입니다.")
+    preview_tag_col1, preview_tag_col2 = st.columns([0.2, 0.8])
+    preview_tag_col1.markdown("`Preview`")
+    preview_tag_col2.write("")
+
     if can_run:
-        show_model_input_summary(
-            context_df=trim_context_to_model_limit(
-                context_df=context_df,
+        with st.container(border=True):
+            st.markdown("**현재 입력 요약**")
+            show_model_input_summary(
+                context_df=trim_context_to_model_limit(
+                    context_df=context_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                ),
+                future_df=future_df,
                 id_column=id_column,
                 timestamp_column=timestamp_column,
-            ),
-            future_df=future_df,
-            id_column=id_column,
-            timestamp_column=timestamp_column,
-            target_column=target_column,
+                target_column=target_column,
+            )
+
+    with st.container(border=True):
+        st.markdown("**준비 중인 실험**")
+        st.markdown(
+            "- 공변량 shuffle 비교\n"
+            "- 평균값 고정(mean-fix) 비교\n"
+            "- scale perturbation 비교\n"
+            "- 개별 covariate 제거 ablation"
+        )
+        st.info(
+            "다음 단계로는 선택한 covariate를 shuffle, mean-fix, scale 변형해서 원본 예측과 비교하는 "
+            "counterfactual 분석을 붙이는 것이 가장 좋습니다."
         )
