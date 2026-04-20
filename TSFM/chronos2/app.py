@@ -27,6 +27,9 @@ st.caption("맥북에서 로컬로 Chronos-2 예측 실험을 빠르게 돌리�
 AUTO_ID_OPTION = "__single_series__"
 AUTO_ID_COLUMN = "__auto_id__"
 WEEKDAY_COVARIATE_COLUMN = "__weekday__"
+WEEKDAY_CODE_COVARIATE_COLUMN = "__weekday_code__"
+WEEKDAY_SIN_COVARIATE_COLUMN = "__weekday_sin__"
+WEEKDAY_COS_COVARIATE_COLUMN = "__weekday_cos__"
 
 
 @st.cache_resource(show_spinner=False)
@@ -135,6 +138,53 @@ def add_weekday_covariate(
 
     derived_future = prepared_context[[id_column, timestamp_column]].drop_duplicates().copy()
     derived_future[WEEKDAY_COVARIATE_COLUMN] = derived_future[timestamp_column].dt.day_name()
+    return prepared_context, derived_future
+
+
+def add_weekday_code_covariate(
+    context_df: pd.DataFrame,
+    future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    prepared_context = context_df.copy()
+    prepared_context[timestamp_column] = pd.to_datetime(prepared_context[timestamp_column], errors="coerce")
+    prepared_context[WEEKDAY_CODE_COVARIATE_COLUMN] = prepared_context[timestamp_column].dt.dayofweek.astype("float64")
+
+    if future_df is not None and not future_df.empty:
+        prepared_future = future_df.copy()
+        prepared_future[timestamp_column] = pd.to_datetime(prepared_future[timestamp_column], errors="coerce")
+        prepared_future[WEEKDAY_CODE_COVARIATE_COLUMN] = prepared_future[timestamp_column].dt.dayofweek.astype("float64")
+        return prepared_context, prepared_future
+
+    derived_future = prepared_context[[id_column, timestamp_column]].drop_duplicates().copy()
+    derived_future[WEEKDAY_CODE_COVARIATE_COLUMN] = derived_future[timestamp_column].dt.dayofweek.astype("float64")
+    return prepared_context, derived_future
+
+
+def add_weekday_cyclical_covariates(
+    context_df: pd.DataFrame,
+    future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    def _append_weekday_cyclical_columns(df: pd.DataFrame) -> pd.DataFrame:
+        prepared = df.copy()
+        prepared[timestamp_column] = pd.to_datetime(prepared[timestamp_column], errors="coerce")
+        weekday_code = prepared[timestamp_column].dt.dayofweek.astype("float64")
+        angle = 2.0 * np.pi * weekday_code / 7.0
+        prepared[WEEKDAY_SIN_COVARIATE_COLUMN] = np.sin(angle)
+        prepared[WEEKDAY_COS_COVARIATE_COLUMN] = np.cos(angle)
+        return prepared
+
+    prepared_context = _append_weekday_cyclical_columns(context_df)
+
+    if future_df is not None and not future_df.empty:
+        prepared_future = _append_weekday_cyclical_columns(future_df)
+        return prepared_context, prepared_future
+
+    derived_future = prepared_context[[id_column, timestamp_column]].drop_duplicates().copy()
+    derived_future = _append_weekday_cyclical_columns(derived_future)
     return prepared_context, derived_future
 
 
@@ -667,28 +717,32 @@ def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> 
         return pd.DataFrame()
 
     grouped = validation_windows_df.groupby("scenario", dropna=False)[metric_columns].mean().reset_index()
-    if set(grouped["scenario"]) != {"요일 미사용", "요일 사용"}:
+    if "요일 미사용" not in set(grouped["scenario"]):
         return grouped
 
     baseline = grouped.loc[grouped["scenario"] == "요일 미사용"].iloc[0]
-    weekday = grouped.loc[grouped["scenario"] == "요일 사용"].iloc[0]
     comparison_rows: list[dict[str, object]] = []
 
-    for metric in metric_columns:
-        delta = float(weekday[metric] - baseline[metric])
-        if metric == "Correlation":
-            better = "개선" if delta > 0 else "악화" if delta < 0 else "동일"
-        else:
-            better = "개선" if delta < 0 else "악화" if delta > 0 else "동일"
-        comparison_rows.append(
-            {
-                "metric": metric,
-                "요일 미사용": float(baseline[metric]),
-                "요일 사용": float(weekday[metric]),
-                "delta": delta,
-                "판정": better,
-            }
-        )
+    for _, scenario_row in grouped.iterrows():
+        scenario_name = str(scenario_row["scenario"])
+        if scenario_name == "요일 미사용":
+            continue
+        for metric in metric_columns:
+            delta = float(scenario_row[metric] - baseline[metric])
+            if metric == "Correlation":
+                better = "개선" if delta > 0 else "악화" if delta < 0 else "동일"
+            else:
+                better = "개선" if delta < 0 else "악화" if delta > 0 else "동일"
+            comparison_rows.append(
+                {
+                    "scenario": scenario_name,
+                    "metric": metric,
+                    "요일 미사용": float(baseline[metric]),
+                    "비교 시나리오": float(scenario_row[metric]),
+                    "delta": delta,
+                    "판정": better,
+                }
+            )
 
     return pd.DataFrame(comparison_rows)
 
@@ -1156,9 +1210,21 @@ with tabs[1]:
                 value=False,
                 help="timestamp에서 요일을 자동 생성해 `요일 미사용`과 `요일 사용` 결과를 비교합니다.",
             )
-            st.caption(
-                "선택하면 기본 검증 외에도 요일 정보를 categorical covariate로 추가한 시나리오를 함께 계산합니다."
-            )
+            weekday_encoding_options = ["문자열", "0~6", "sin/cos"]
+            selected_weekday_encodings = ["문자열"]
+            if compare_weekday_covariate:
+                selected_weekday_encodings = st.multiselect(
+                    "비교할 요일 인코딩",
+                    options=weekday_encoding_options,
+                    default=weekday_encoding_options,
+                    help="현재 문자열 방식은 유지하고, 숫자형/주기형 인코딩을 함께 비교할 수 있습니다.",
+                )
+                if not selected_weekday_encodings:
+                    st.caption("요일 비교를 켠 경우 최소 1개 인코딩을 선택해야 합니다.")
+            else:
+                st.caption(
+                    "선택하면 기본 검증 외에도 요일 정보를 covariate로 추가한 시나리오를 함께 계산합니다."
+                )
 
     if st.button("슬라이딩 윈도우 검증 실행", type="primary", disabled=not can_run):
         try:
@@ -1182,31 +1248,39 @@ with tabs[1]:
                 windows_df["scenario"] = "요일 미사용"
 
                 comparison_summary_df = pd.DataFrame()
-                if compare_weekday_covariate:
-                    weekday_context_df, weekday_future_df = add_weekday_covariate(
-                        context_df=context_df,
-                        future_df=future_df,
-                        id_column=id_column,
-                        timestamp_column=timestamp_column,
-                    )
-                    weekday_summary_df, weekday_windows_df = run_sliding_window_validation(
-                        pipeline=pipeline,
-                        context_df=weekday_context_df,
-                        future_df=weekday_future_df,
-                        id_column=id_column,
-                        timestamp_column=timestamp_column,
-                        target_column=target_column,
-                        context_length=int(validation_context_length),
-                        prediction_length=int(validation_prediction_length),
-                        stride=int(validation_stride),
-                        max_windows=max_windows,
-                    )
-                    weekday_summary_df = weekday_summary_df.copy()
-                    weekday_windows_df = weekday_windows_df.copy()
-                    weekday_summary_df["scenario"] = "요일 사용"
-                    weekday_windows_df["scenario"] = "요일 사용"
-                    summary_df = pd.concat([summary_df, weekday_summary_df], ignore_index=True)
-                    windows_df = pd.concat([windows_df, weekday_windows_df], ignore_index=True)
+                if compare_weekday_covariate and selected_weekday_encodings:
+                    weekday_scenarios = [
+                        ("문자열", "요일 문자열", add_weekday_covariate),
+                        ("0~6", "요일 0~6", add_weekday_code_covariate),
+                        ("sin/cos", "요일 sin/cos", add_weekday_cyclical_covariates),
+                    ]
+                    for encoding_key, scenario_name, scenario_builder in weekday_scenarios:
+                        if encoding_key not in selected_weekday_encodings:
+                            continue
+                        weekday_context_df, weekday_future_df = scenario_builder(
+                            context_df=context_df,
+                            future_df=future_df,
+                            id_column=id_column,
+                            timestamp_column=timestamp_column,
+                        )
+                        weekday_summary_df, weekday_windows_df = run_sliding_window_validation(
+                            pipeline=pipeline,
+                            context_df=weekday_context_df,
+                            future_df=weekday_future_df,
+                            id_column=id_column,
+                            timestamp_column=timestamp_column,
+                            target_column=target_column,
+                            context_length=int(validation_context_length),
+                            prediction_length=int(validation_prediction_length),
+                            stride=int(validation_stride),
+                            max_windows=max_windows,
+                        )
+                        weekday_summary_df = weekday_summary_df.copy()
+                        weekday_windows_df = weekday_windows_df.copy()
+                        weekday_summary_df["scenario"] = scenario_name
+                        weekday_windows_df["scenario"] = scenario_name
+                        summary_df = pd.concat([summary_df, weekday_summary_df], ignore_index=True)
+                        windows_df = pd.concat([windows_df, weekday_windows_df], ignore_index=True)
                     comparison_summary_df = build_validation_comparison_summary(windows_df)
 
                 st.session_state["validation_summary_df"] = summary_df
@@ -1238,7 +1312,12 @@ with tabs[1]:
             )
             trend_fig = go.Figure()
             if "scenario" in validation_windows_df.columns:
-                line_colors = {"요일 미사용": "#1d3557", "요일 사용": "#e76f51"}
+                line_colors = {
+                    "요일 미사용": "#1d3557",
+                    "요일 문자열": "#e76f51",
+                    "요일 0~6": "#2a9d8f",
+                    "요일 sin/cos": "#f4a261",
+                }
                 for scenario_name, group in validation_windows_df.groupby("scenario", dropna=False):
                     group = group.sort_values("window_index")
                     trend_fig.add_trace(
