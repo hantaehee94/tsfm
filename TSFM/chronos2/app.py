@@ -36,6 +36,11 @@ def get_pipeline(model_id: str, device: str):
     return load_pipeline(model_id, device)
 
 
+@st.cache_data(show_spinner=False)
+def load_uploaded_table(uploaded_file_name: str, raw_bytes: bytes) -> pd.DataFrame:
+    return load_table(uploaded_file_name, raw_bytes)
+
+
 def guess_id_column(df: pd.DataFrame) -> str:
     preferred_names = ["id", "item_id", "series_id", "unique_id"]
     lower_map = {col.lower(): col for col in df.columns}
@@ -899,15 +904,15 @@ with tabs[0]:
     with prep_col:
         with st.container(border=True):
             st.markdown("**1. 데이터 준비**")
-            st.caption("과거 데이터는 필수이고, 미래 공변량은 선택입니다. CSV와 Parquet를 지원합니다.")
-            context_file = st.file_uploader("과거 데이터", type=["csv", "parquet"])
-            future_file = st.file_uploader("미래 공변량", type=["csv", "parquet"])
+            st.caption("과거 데이터는 필수이고, 미래 공변량은 선택입니다. CSV, Parquet, TSF를 지원합니다.")
+            context_file = st.file_uploader("과거 데이터", type=["csv", "parquet", "pq", "tsf"])
+            future_file = st.file_uploader("미래 공변량", type=["csv", "parquet", "pq", "tsf"])
 
             if context_file:
-                context_df = load_table(context_file.name, context_file.getvalue())
+                context_df = load_uploaded_table(context_file.name, context_file.getvalue())
                 full_context_df = context_df.copy()
                 if future_file:
-                    future_df = load_table(future_file.name, future_file.getvalue())
+                    future_df = load_uploaded_table(future_file.name, future_file.getvalue())
 
     with inspect_col:
         with st.container(border=True):

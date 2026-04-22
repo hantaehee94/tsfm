@@ -43,6 +43,12 @@ id, timestamp, target, covariates...
 id, timestamp, known_covariates...
 ```
 
+지원 포맷:
+
+- `csv`
+- `parquet` / `pq`
+- `tsf`
+
 ## 현재 앱에서 할 수 있는 일
 
 - 파일 업로드 기반 단일 예측
