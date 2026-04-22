@@ -681,7 +681,7 @@ def run_sliding_window_validation(
     prediction_length: int,
     stride: int,
     max_windows: int | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     windows = build_sliding_windows(
         context_df=context_df,
         future_df=future_df,
@@ -694,6 +694,9 @@ def run_sliding_window_validation(
     )
 
     window_rows: list[dict[str, object]] = []
+    history_frames: list[pd.DataFrame] = []
+    pred_frames: list[pd.DataFrame] = []
+    actual_frames: list[pd.DataFrame] = []
     for window in windows:
         history_df = trim_context_to_model_limit(
             context_df=window["history_df"],
@@ -717,6 +720,15 @@ def run_sliding_window_validation(
             timestamp_column=timestamp_column,
             target_column=target_column,
         ).iloc[0].to_dict()
+        history_with_window = history_df.copy()
+        history_with_window["window_index"] = int(window["window_index"])
+        pred_with_window = pred_df.copy()
+        pred_with_window["window_index"] = int(window["window_index"])
+        actual_with_window = window["actual_df"].copy()
+        actual_with_window["window_index"] = int(window["window_index"])
+        history_frames.append(history_with_window)
+        pred_frames.append(pred_with_window)
+        actual_frames.append(actual_with_window)
         window_rows.append(
             {
                 "window_index": int(window["window_index"]),
@@ -744,7 +756,10 @@ def run_sliding_window_validation(
             "Correlation_std": [float(windows_df["Correlation"].std(ddof=0))],
         }
     )
-    return summary_df, windows_df
+    history_detail_df = pd.concat(history_frames, ignore_index=True) if history_frames else pd.DataFrame()
+    pred_detail_df = pd.concat(pred_frames, ignore_index=True) if pred_frames else pd.DataFrame()
+    actual_detail_df = pd.concat(actual_frames, ignore_index=True) if actual_frames else pd.DataFrame()
+    return summary_df, windows_df, history_detail_df, pred_detail_df, actual_detail_df
 
 
 def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> pd.DataFrame:
@@ -1243,7 +1258,7 @@ with tabs[1]:
         try:
             with st.spinner("슬라이딩 윈도우 검증을 수행하는 중입니다..."):
                 pipeline = get_pipeline(model_id, device)
-                summary_df, windows_df = run_sliding_window_validation(
+                summary_df, windows_df, validation_history_df, validation_pred_df, validation_actual_df = run_sliding_window_validation(
                     pipeline=pipeline,
                     context_df=context_df,
                     future_df=future_df,
@@ -1257,8 +1272,14 @@ with tabs[1]:
                 )
                 summary_df = summary_df.copy()
                 windows_df = windows_df.copy()
+                validation_history_df = validation_history_df.copy()
+                validation_pred_df = validation_pred_df.copy()
+                validation_actual_df = validation_actual_df.copy()
                 summary_df["scenario"] = "요일 미사용"
                 windows_df["scenario"] = "요일 미사용"
+                validation_history_df["scenario"] = "요일 미사용"
+                validation_pred_df["scenario"] = "요일 미사용"
+                validation_actual_df["scenario"] = "요일 미사용"
 
                 comparison_summary_df = pd.DataFrame()
                 if compare_weekday_covariate:
@@ -1275,7 +1296,7 @@ with tabs[1]:
                             encoding=selected_weekday_encoding,
                             include_future_covariate=include_future_covariate,
                         )
-                        weekday_summary_df, weekday_windows_df = run_sliding_window_validation(
+                        weekday_summary_df, weekday_windows_df, weekday_history_df, weekday_pred_df, weekday_actual_df = run_sliding_window_validation(
                             pipeline=pipeline,
                             context_df=weekday_context_df,
                             future_df=weekday_future_df,
@@ -1289,15 +1310,27 @@ with tabs[1]:
                         )
                         weekday_summary_df = weekday_summary_df.copy()
                         weekday_windows_df = weekday_windows_df.copy()
+                        weekday_history_df = weekday_history_df.copy()
+                        weekday_pred_df = weekday_pred_df.copy()
+                        weekday_actual_df = weekday_actual_df.copy()
                         weekday_summary_df["scenario"] = scenario_name
                         weekday_windows_df["scenario"] = scenario_name
+                        weekday_history_df["scenario"] = scenario_name
+                        weekday_pred_df["scenario"] = scenario_name
+                        weekday_actual_df["scenario"] = scenario_name
                         summary_df = pd.concat([summary_df, weekday_summary_df], ignore_index=True)
                         windows_df = pd.concat([windows_df, weekday_windows_df], ignore_index=True)
+                        validation_history_df = pd.concat([validation_history_df, weekday_history_df], ignore_index=True)
+                        validation_pred_df = pd.concat([validation_pred_df, weekday_pred_df], ignore_index=True)
+                        validation_actual_df = pd.concat([validation_actual_df, weekday_actual_df], ignore_index=True)
                     comparison_summary_df = build_validation_comparison_summary(windows_df)
 
                 st.session_state["validation_summary_df"] = summary_df
                 st.session_state["validation_windows_df"] = windows_df
                 st.session_state["validation_comparison_summary_df"] = comparison_summary_df
+                st.session_state["validation_history_detail_df"] = validation_history_df
+                st.session_state["validation_pred_detail_df"] = validation_pred_df
+                st.session_state["validation_actual_detail_df"] = validation_actual_df
             st.success("자동 검증이 완료되었습니다.")
         except Exception as exc:
             st.error(f"자동 검증 중 오류가 발생했습니다: {exc}")
@@ -1305,6 +1338,9 @@ with tabs[1]:
     validation_summary_df = st.session_state.get("validation_summary_df")
     validation_windows_df = st.session_state.get("validation_windows_df")
     validation_comparison_summary_df = st.session_state.get("validation_comparison_summary_df")
+    validation_history_detail_df = st.session_state.get("validation_history_detail_df")
+    validation_pred_detail_df = st.session_state.get("validation_pred_detail_df")
+    validation_actual_detail_df = st.session_state.get("validation_actual_detail_df")
 
     if isinstance(validation_summary_df, pd.DataFrame) and not validation_summary_df.empty:
         with st.container(border=True):
@@ -1369,6 +1405,66 @@ with tabs[1]:
             with st.container(border=True):
                 st.markdown("**윈도우별 검증 결과**")
                 st.dataframe(validation_windows_df, use_container_width=True)
+
+    if (
+        isinstance(validation_history_detail_df, pd.DataFrame)
+        and not validation_history_detail_df.empty
+        and isinstance(validation_pred_detail_df, pd.DataFrame)
+        and not validation_pred_detail_df.empty
+        and isinstance(validation_actual_detail_df, pd.DataFrame)
+        and not validation_actual_detail_df.empty
+    ):
+        with st.container(border=True):
+            st.markdown("**시나리오별 Actual vs Prediction**")
+            preview_col1, preview_col2, preview_col3 = st.columns(3)
+            scenario_options = validation_pred_detail_df["scenario"].dropna().astype(str).unique().tolist()
+            selected_validation_scenario = preview_col1.selectbox(
+                "시나리오",
+                options=scenario_options,
+                key="validation_preview_scenario",
+            )
+            scenario_pred_df = validation_pred_detail_df.loc[
+                validation_pred_detail_df["scenario"].astype(str) == selected_validation_scenario
+            ].copy()
+            scenario_history_df = validation_history_detail_df.loc[
+                validation_history_detail_df["scenario"].astype(str) == selected_validation_scenario
+            ].copy()
+            scenario_actual_df = validation_actual_detail_df.loc[
+                validation_actual_detail_df["scenario"].astype(str) == selected_validation_scenario
+            ].copy()
+
+            window_options = sorted(scenario_pred_df["window_index"].dropna().astype(int).unique().tolist())
+            selected_validation_window = preview_col2.selectbox(
+                "윈도우",
+                options=window_options,
+                key="validation_preview_window",
+            )
+            selected_history_df = scenario_history_df.loc[
+                scenario_history_df["window_index"].astype(int) == selected_validation_window
+            ].copy()
+            selected_pred_df = scenario_pred_df.loc[
+                scenario_pred_df["window_index"].astype(int) == selected_validation_window
+            ].copy()
+            selected_actual_df = scenario_actual_df.loc[
+                scenario_actual_df["window_index"].astype(int) == selected_validation_window
+            ].copy()
+
+            available_ids = selected_history_df[id_column].astype(str).unique().tolist()
+            selected_validation_id = preview_col3.selectbox(
+                "시계열",
+                options=available_ids,
+                key="validation_preview_series",
+            )
+            preview_figure = build_plot_frame(
+                history_df=selected_history_df,
+                pred_df=selected_pred_df,
+                actual_future_df=selected_actual_df,
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                target_column=target_column,
+                selected_id=selected_validation_id,
+            )
+            st.plotly_chart(preview_figure, use_container_width=True)
 
 with tabs[2]:
     st.subheader("Covariate Lab")
