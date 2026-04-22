@@ -11,7 +11,6 @@ import streamlit as st
 from chronos2_core import (
     CHRONOS2_MAX_CONTEXT_LENGTH,
     CHRONOS2_MAX_PREDICTION_LENGTH,
-    build_example_frames,
     detect_device,
     load_pipeline,
     load_table,
@@ -855,14 +854,14 @@ experiment_mode = "선택 구간 끝에서 미래 예측"
 default_prediction_length = int(st.session_state.get("prediction_length_input", 24))
 default_model_id = str(st.session_state.get("model_id_input", "amazon/chronos-2"))
 default_device = str(st.session_state.get("device_input", device_options[0]))
-default_source_mode = str(st.session_state.get("source_mode_input", "합성 예제"))
+source_mode = "파일 업로드"
 
 st.markdown("로컬에서 예측, 검증, 공변량 실험을 빠르게 반복하는 시계열 워크벤치")
 
 global_settings = st.container(border=True)
 with global_settings:
     st.markdown("**전역 설정**")
-    setting_col1, setting_col2, setting_col3, setting_col4 = st.columns([2, 1, 1, 1])
+    setting_col1, setting_col2, setting_col3 = st.columns([2, 1, 1])
     with setting_col1:
         model_id = st.text_input("모델 ID", value=default_model_id, key="model_id_input")
     with setting_col2:
@@ -877,13 +876,6 @@ with global_settings:
             step=1,
             key="prediction_length_input",
         )
-    with setting_col4:
-        source_mode = st.radio(
-            "데이터 소스",
-            options=["합성 예제", "파일 업로드"],
-            index=0 if default_source_mode == "합성 예제" else 1,
-            key="source_mode_input",
-        )
 
 tabs = st.tabs(["Forecast", "Validation", "Covariate Lab"])
 
@@ -895,50 +887,20 @@ with tabs[0]:
     with prep_col:
         with st.container(border=True):
             st.markdown("**1. 데이터 준비**")
-            if source_mode == "합성 예제":
-                synthetic_col1, synthetic_col2 = st.columns(2)
-                with synthetic_col1:
-                    num_series = st.number_input("시계열 개수", min_value=1, max_value=50, value=3, step=1)
-                with synthetic_col2:
-                    context_length = st.number_input(
-                        "과거 길이",
-                        min_value=8,
-                        max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
-                        value=96,
-                        step=8,
-                    )
-                use_future_covariates = st.checkbox("미래 공변량 사용", value=True)
+            st.caption("과거 데이터는 필수이고, 미래 공변량은 선택입니다. CSV와 Parquet를 지원합니다.")
+            context_file = st.file_uploader("과거 데이터", type=["csv", "parquet"])
+            future_file = st.file_uploader("미래 공변량", type=["csv", "parquet"])
 
-                context_df, generated_future_df = build_example_frames(
-                    num_series=int(num_series),
-                    context_length=int(context_length),
-                    prediction_length=int(prediction_length),
-                )
+            if context_file:
+                context_df = load_table(context_file.name, context_file.getvalue())
                 full_context_df = context_df.copy()
-                future_df = generated_future_df if use_future_covariates else None
-                id_column = "id"
-                timestamp_column = "timestamp"
-                target_column = "target"
-
-                if use_future_covariates:
-                    st.caption("합성 데이터와 미래 공변량을 함께 사용해 예측합니다.")
-                else:
-                    st.caption("합성 데이터의 과거 구간만 사용해 미래 공변량 없이 예측합니다.")
-            else:
-                st.caption("과거 데이터는 필수이고, 미래 공변량은 선택입니다. CSV와 Parquet를 지원합니다.")
-                context_file = st.file_uploader("과거 데이터", type=["csv", "parquet"])
-                future_file = st.file_uploader("미래 공변량", type=["csv", "parquet"])
-
-                if context_file:
-                    context_df = load_table(context_file.name, context_file.getvalue())
-                    full_context_df = context_df.copy()
-                    if future_file:
-                        future_df = load_table(future_file.name, future_file.getvalue())
+                if future_file:
+                    future_df = load_table(future_file.name, future_file.getvalue())
 
     with inspect_col:
         with st.container(border=True):
             st.markdown("**2. 입력 확인**")
-            if source_mode == "파일 업로드" and not context_df.empty:
+            if not context_df.empty:
                 st.markdown("스키마 매핑")
                 guessed_id_column = guess_id_column(context_df)
                 guessed_timestamp_column = guess_timestamp_column(context_df)
@@ -1058,10 +1020,8 @@ with tabs[0]:
                     start_idx=int(start_idx),
                     end_idx=int(end_idx),
                 )
-            elif source_mode == "파일 업로드":
-                st.info("과거 데이터를 업로드하면 스키마 매핑과 분석 구간 선택이 열립니다.")
             else:
-                st.info("합성 예제는 바로 예측 가능한 형태로 준비됩니다.")
+                st.info("과거 데이터를 업로드하면 스키마 매핑과 분석 구간 선택이 열립니다.")
 
     can_run = not context_df.empty
     if can_run:
@@ -1117,7 +1077,7 @@ with tabs[0]:
                     model_future_df = future_df
                     actual_future_df = None
 
-                    if source_mode == "파일 업로드" and experiment_mode == "데이터셋 내부 평가":
+                    if experiment_mode == "데이터셋 내부 평가":
                         model_context_df, actual_future_df, model_future_df = build_evaluation_split(
                             context_df=context_df,
                             future_df=future_df,
@@ -1125,7 +1085,7 @@ with tabs[0]:
                             timestamp_column=timestamp_column,
                             prediction_length=int(prediction_length),
                         )
-                    elif source_mode == "파일 업로드" and experiment_mode == "선택 구간 끝에서 미래 예측":
+                    elif experiment_mode == "선택 구간 끝에서 미래 예측":
                         actual_future_df, model_future_df = build_future_comparison_split(
                             full_context_df=full_context_df,
                             model_context_df=model_context_df,
