@@ -106,16 +106,18 @@ def filter_model_columns(
     id_column: str,
     timestamp_column: str,
     target_column: str,
-    past_covariates: list[str],
+    past_only_covariates: list[str],
+    known_future_covariates: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
-    keep_context_columns = [id_column, timestamp_column, target_column, *past_covariates]
+    context_covariates = list(dict.fromkeys([*past_only_covariates, *known_future_covariates]))
+    keep_context_columns = [id_column, timestamp_column, target_column, *context_covariates]
     prepared_context = context_df.loc[:, [col for col in keep_context_columns if col in context_df.columns]].copy()
     prepared_full_context = full_context_df.loc[:, [col for col in keep_context_columns if col in full_context_df.columns]].copy()
 
     if future_df is None or future_df.empty:
         return prepared_context, prepared_full_context, future_df
 
-    keep_future_columns = [col for col in future_df.columns if col not in past_covariates]
+    keep_future_columns = [id_column, timestamp_column, *known_future_covariates]
     prepared_future = future_df.loc[:, keep_future_columns].copy()
     return prepared_context, prepared_full_context, prepared_future
 
@@ -973,13 +975,31 @@ with tabs[0]:
                 )
                 full_context_df = context_df.copy()
 
-                available_past_covariates = [
+                available_context_covariates = [
                     col for col in context_df.columns if col not in {id_column, timestamp_column, target_column}
                 ]
-                selected_past_covariates = st.multiselect(
-                    "과거 공변량",
-                    options=available_past_covariates,
+                available_known_future_covariates: list[str] = []
+                if future_df is not None and not future_df.empty:
+                    available_known_future_covariates = [
+                        col
+                        for col in future_df.columns
+                        if col in available_context_covariates and col not in {id_column, timestamp_column, target_column}
+                    ]
+
+                selected_known_future_covariates = st.multiselect(
+                    "미래 known 공변량",
+                    options=available_known_future_covariates,
                     default=[],
+                    help="예측 시점에도 미리 알고 있는 값만 선택합니다. 선택한 컬럼은 context와 future에 함께 사용됩니다.",
+                )
+                available_past_only_covariates = [
+                    col for col in available_context_covariates if col not in set(selected_known_future_covariates)
+                ]
+                selected_past_only_covariates = st.multiselect(
+                    "과거 전용 공변량",
+                    options=available_past_only_covariates,
+                    default=[],
+                    help="과거 구간에서만 관측 가능한 값입니다. future에는 전달되지 않습니다.",
                 )
                 context_df, full_context_df, future_df = filter_model_columns(
                     context_df=context_df,
@@ -988,7 +1008,8 @@ with tabs[0]:
                     id_column=id_column,
                     timestamp_column=timestamp_column,
                     target_column=target_column,
-                    past_covariates=selected_past_covariates,
+                    past_only_covariates=selected_past_only_covariates,
+                    known_future_covariates=selected_known_future_covariates,
                 )
 
                 st.markdown("분석 구간 선택")
