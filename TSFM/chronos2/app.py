@@ -799,7 +799,6 @@ def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> 
 
 
 def show_top_status(
-    source_mode: str,
     context_df: pd.DataFrame,
     prediction_length: int,
     device: str,
@@ -810,11 +809,10 @@ def show_top_status(
     if not context_df.empty and id_column and timestamp_column:
         series_count = int(get_series_lengths(context_df, id_column, timestamp_column).shape[0])
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("데이터 소스", source_mode)
-    col2.metric("시계열 수", series_count)
-    col3.metric("예측 구간 길이", int(prediction_length))
-    col4.metric("실행 장치", device)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("시계열 수", series_count)
+    col2.metric("예측 구간 길이", int(prediction_length))
+    col3.metric("실행 장치", device)
 
 
 def show_metric_cards(metrics_df: pd.DataFrame) -> None:
@@ -869,7 +867,6 @@ experiment_mode = "선택 구간 끝에서 미래 예측"
 default_prediction_length = int(st.session_state.get("prediction_length_input", 24))
 default_model_id = str(st.session_state.get("model_id_input", "amazon/chronos-2"))
 default_device = str(st.session_state.get("device_input", device_options[0]))
-source_mode = "파일 업로드"
 
 st.markdown("로컬에서 예측, 검증, 공변량 실험을 빠르게 반복하는 시계열 워크벤치")
 
@@ -1041,7 +1038,6 @@ with tabs[0]:
     can_run = not context_df.empty
     if can_run:
         show_top_status(
-            source_mode=source_mode,
             context_df=context_df,
             prediction_length=int(prediction_length),
             device=device,
@@ -1192,7 +1188,6 @@ with tabs[1]:
     st.caption("현재 준비된 데이터 구간으로 슬라이딩 윈도우 검증을 수행합니다.")
 
     show_top_status(
-        source_mode=source_mode,
         context_df=context_df,
         prediction_length=int(prediction_length),
         device=device,
