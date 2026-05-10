@@ -29,6 +29,32 @@ WEEKDAY_COVARIATE_COLUMN = "__weekday__"
 WEEKDAY_CODE_COVARIATE_COLUMN = "__weekday_code__"
 WEEKDAY_SIN_COVARIATE_COLUMN = "__weekday_sin__"
 WEEKDAY_COS_COVARIATE_COLUMN = "__weekday_cos__"
+WEEKDAY_ENCODINGS = ("문자열", "0~6", "sin/cos")
+WEEKDAY_ENCODING_LABELS = {"문자열": "文字", "0~6": "0~6", "sin/cos": "sin.cos"}
+WEEKDAY_COVARIATE_SCOPES = (("過去", False), ("過去+未来", True))
+WEEKDAY_BASELINE_SCENARIO = "曜日-無"
+POINT_PREDICTION_COLUMN_CANDIDATES = ("predictions", 0.5, "0.5")
+INFLUENCE_SOURCE_CONTEXT = "과거 context"
+INFLUENCE_SOURCE_FUTURE = "미래 known covariate"
+
+
+def build_weekday_scenario_name(encoding: str, include_future_covariate: bool) -> str:
+    encoding_label = WEEKDAY_ENCODING_LABELS.get(encoding, encoding)
+    scope_label = "過去+未来" if include_future_covariate else "過去"
+    return f"曜日-有({encoding_label},{scope_label})"
+
+
+def get_weekday_scenario_color(scenario: str) -> str:
+    line_colors = {
+        WEEKDAY_BASELINE_SCENARIO: "#1d3557",
+        build_weekday_scenario_name("문자열", False): "#e76f51",
+        build_weekday_scenario_name("문자열", True): "#f4a261",
+        build_weekday_scenario_name("0~6", False): "#457b9d",
+        build_weekday_scenario_name("0~6", True): "#2a9d8f",
+        build_weekday_scenario_name("sin/cos", False): "#7b2cbf",
+        build_weekday_scenario_name("sin/cos", True): "#6c757d",
+    }
+    return line_colors.get(scenario, "#495057")
 
 
 @st.cache_resource(show_spinner=False)
@@ -229,6 +255,83 @@ def build_weekday_covariate_frames(
     )
 
 
+def infer_series_frequency(timestamps: pd.Series) -> pd.Timedelta:
+    prepared = pd.to_datetime(timestamps, errors="coerce").dropna().sort_values()
+    if len(prepared) < 2:
+        raise ValueError("미래 요일 공변량을 만들려면 시계열당 최소 2개 timestamp가 필요합니다.")
+
+    deltas = prepared.diff().dropna()
+    positive_deltas = deltas.loc[deltas > pd.Timedelta(0)]
+    if positive_deltas.empty:
+        raise ValueError("timestamp 간격을 추정하지 못했습니다.")
+    return positive_deltas.value_counts().idxmax()
+
+
+def build_future_calendar_frame(
+    context_df: pd.DataFrame,
+    actual_future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+    prediction_length: int,
+) -> pd.DataFrame:
+    if actual_future_df is not None and not actual_future_df.empty:
+        prepared_actual = actual_future_df[[id_column, timestamp_column]].drop_duplicates().copy()
+        prepared_actual[timestamp_column] = pd.to_datetime(prepared_actual[timestamp_column], errors="coerce")
+        return prepared_actual
+
+    prepared_context = context_df.copy()
+    prepared_context[timestamp_column] = pd.to_datetime(prepared_context[timestamp_column], errors="coerce")
+    prepared_context = prepared_context.sort_values([id_column, timestamp_column])
+
+    rows: list[dict[str, object]] = []
+    for series_id, group in prepared_context.groupby(id_column, dropna=False):
+        valid_timestamps = group[timestamp_column].dropna().sort_values()
+        if valid_timestamps.empty:
+            raise ValueError(f"`{series_id}` 시계열의 timestamp가 비어 있습니다.")
+
+        frequency = infer_series_frequency(valid_timestamps)
+        last_timestamp = valid_timestamps.iloc[-1]
+        for horizon in range(1, prediction_length + 1):
+            rows.append(
+                {
+                    id_column: series_id,
+                    timestamp_column: last_timestamp + frequency * horizon,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def prepare_weekday_forecast_inputs(
+    model_context_df: pd.DataFrame,
+    model_future_df: pd.DataFrame | None,
+    actual_future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+    prediction_length: int,
+    encoding: str,
+    include_future_covariate: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    scenario_future_df = model_future_df
+    if include_future_covariate and (scenario_future_df is None or scenario_future_df.empty):
+        scenario_future_df = build_future_calendar_frame(
+            context_df=model_context_df,
+            actual_future_df=actual_future_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+            prediction_length=prediction_length,
+        )
+
+    return build_weekday_covariate_frames(
+        context_df=model_context_df,
+        future_df=scenario_future_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+        encoding=encoding,
+        include_future_covariate=include_future_covariate,
+    )
+
+
 def trim_by_index_window(
     df: pd.DataFrame | None,
     id_column: str,
@@ -321,6 +424,10 @@ def build_future_comparison_split(
     actual_future = prepared_full.loc[(full_positions >= horizon_start) & (full_positions < horizon_end)].copy()
 
     if actual_future.empty:
+        if future_df is not None and not future_df.empty:
+            prepared_future = future_df.copy()
+            prepared_future[timestamp_column] = pd.to_datetime(prepared_future[timestamp_column], errors="coerce")
+            return None, prepared_future
         return None, None
 
     if future_df is None or future_df.empty:
@@ -331,6 +438,49 @@ def build_future_comparison_split(
     horizon_keys = actual_future[[id_column, timestamp_column]].drop_duplicates()
     filtered_future = prepared_future.merge(horizon_keys, on=[id_column, timestamp_column], how="inner")
     return actual_future, filtered_future
+
+
+def prepare_model_inputs_for_forecast(
+    context_df: pd.DataFrame,
+    full_context_df: pd.DataFrame,
+    future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+    prediction_length: int,
+    experiment_mode: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+    model_context_df = trim_context_to_model_limit(
+        context_df=context_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+    )
+    model_future_df = future_df
+    actual_future_df = None
+
+    if experiment_mode == "데이터셋 내부 평가":
+        model_context_df, actual_future_df, model_future_df = build_evaluation_split(
+            context_df=context_df,
+            future_df=future_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+            prediction_length=prediction_length,
+        )
+    elif experiment_mode == "선택 구간 끝에서 미래 예측":
+        actual_future_df, model_future_df = build_future_comparison_split(
+            full_context_df=full_context_df,
+            model_context_df=model_context_df,
+            future_df=future_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+            prediction_length=prediction_length,
+        )
+
+    model_context_df = trim_context_to_model_limit(
+        context_df=model_context_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+    )
+    return model_context_df, model_future_df, actual_future_df
 
 
 def compute_metrics(
@@ -610,6 +760,594 @@ def show_model_input_summary(
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
 
+def get_point_prediction_column(
+    pred_df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+) -> object:
+    for column in POINT_PREDICTION_COLUMN_CANDIDATES:
+        if column in pred_df.columns:
+            return column
+
+    excluded_columns = {id_column, timestamp_column}
+    numeric_columns = [
+        col for col in pred_df.select_dtypes(include=["number"]).columns if col not in excluded_columns
+    ]
+    if numeric_columns:
+        return numeric_columns[0]
+    raise ValueError("예측 결과에서 point prediction 컬럼을 찾지 못했습니다.")
+
+
+def extract_selected_point_forecast(
+    pred_df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+    selected_id: str,
+) -> pd.DataFrame:
+    point_column = get_point_prediction_column(
+        pred_df=pred_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+    )
+    forecast = pred_df.loc[
+        pred_df[id_column].astype(str) == selected_id,
+        [timestamp_column, point_column],
+    ].copy()
+    if forecast.empty:
+        raise ValueError(f"`{selected_id}` 시계열의 예측 결과를 찾지 못했습니다.")
+
+    forecast[timestamp_column] = pd.to_datetime(forecast[timestamp_column], errors="coerce")
+    forecast = forecast.sort_values(timestamp_column).reset_index(drop=True)
+    forecast = forecast.rename(columns={point_column: "prediction"})
+    forecast["horizon_index"] = np.arange(1, len(forecast) + 1)
+    forecast["horizon_label"] = forecast["horizon_index"].map(lambda value: f"h+{int(value)}")
+    return forecast
+
+
+def format_short_timestamp(value: object) -> str:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return ""
+    if timestamp.hour == 0 and timestamp.minute == 0 and timestamp.second == 0:
+        return timestamp.strftime("%Y-%m-%d")
+    return timestamp.strftime("%Y-%m-%d %H:%M")
+
+
+def get_series_rows_for_influence(
+    df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+    selected_id: str,
+) -> pd.DataFrame:
+    series = df.loc[df[id_column].astype(str) == selected_id].copy()
+    if series.empty:
+        raise ValueError(f"`{selected_id}` 시계열을 찾지 못했습니다.")
+
+    series[timestamp_column] = pd.to_datetime(series[timestamp_column], errors="coerce")
+    return series.sort_values(timestamp_column).reset_index(drop=False)
+
+
+def build_influence_windows(
+    source_df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+    selected_id: str,
+    input_source: str,
+    analysis_length: int,
+    window_size: int,
+    stride: int,
+    max_windows: int,
+) -> list[dict[str, object]]:
+    series = get_series_rows_for_influence(
+        df=source_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+        selected_id=selected_id,
+    )
+    total_length = len(series)
+    if total_length == 0:
+        return []
+
+    analysis_length = min(max(1, int(analysis_length)), total_length)
+    window_size = min(max(1, int(window_size)), analysis_length)
+    stride = max(1, int(stride))
+    recent_start = max(0, total_length - analysis_length)
+    prefix = "hist" if input_source == INFLUENCE_SOURCE_CONTEXT else "future"
+
+    windows: list[dict[str, object]] = []
+    start_idx = recent_start
+    while start_idx < total_length:
+        end_idx = min(total_length - 1, start_idx + window_size - 1)
+        window_rows = series.iloc[start_idx : end_idx + 1]
+        window_start = window_rows[timestamp_column].iloc[0]
+        window_end = window_rows[timestamp_column].iloc[-1]
+        windows.append(
+            {
+                "start_idx": int(start_idx),
+                "end_idx": int(end_idx),
+                "window_label": f"{prefix} {int(start_idx)}-{int(end_idx)}",
+                "window_time_range": (
+                    f"{format_short_timestamp(window_start)} ~ {format_short_timestamp(window_end)}"
+                ),
+                "window_start": window_start,
+                "window_end": window_end,
+            }
+        )
+        if end_idx >= total_length - 1:
+            break
+        start_idx += stride
+
+    if max_windows > 0 and len(windows) > max_windows:
+        return windows[-max_windows:]
+    return windows
+
+
+def get_perturbation_replacement(values: pd.Series, replacement_method: str) -> object:
+    if replacement_method == "zero" and pd.api.types.is_numeric_dtype(values):
+        return 0.0
+
+    clean_values = values.dropna()
+    if pd.api.types.is_numeric_dtype(values):
+        if clean_values.empty:
+            return 0.0
+        return float(clean_values.mean())
+
+    if clean_values.empty:
+        return ""
+    modes = clean_values.mode(dropna=True)
+    if not modes.empty:
+        return modes.iloc[0]
+    return clean_values.iloc[0]
+
+
+def perturb_series_window(
+    df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+    selected_id: str,
+    perturb_column: str,
+    start_idx: int,
+    end_idx: int,
+    replacement_method: str,
+) -> pd.DataFrame:
+    if perturb_column not in df.columns:
+        raise ValueError(f"`{perturb_column}` 컬럼을 찾지 못했습니다.")
+
+    prepared = df.copy()
+    prepared[timestamp_column] = pd.to_datetime(prepared[timestamp_column], errors="coerce")
+    selected_mask = prepared[id_column].astype(str) == selected_id
+    ordered_indices = prepared.loc[selected_mask].sort_values(timestamp_column).index.tolist()
+    target_indices = ordered_indices[int(start_idx) : int(end_idx) + 1]
+    if not target_indices:
+        return prepared
+
+    replacement = get_perturbation_replacement(
+        values=prepared.loc[selected_mask, perturb_column],
+        replacement_method=replacement_method,
+    )
+    prepared.loc[target_indices, perturb_column] = replacement
+    return prepared
+
+
+def run_prediction_influence_analysis(
+    pipeline,
+    context_df: pd.DataFrame,
+    future_df: pd.DataFrame | None,
+    prediction_length: int,
+    id_column: str,
+    timestamp_column: str,
+    target_column: str,
+    selected_id: str,
+    input_source: str,
+    perturb_column: str,
+    analysis_length: int,
+    window_size: int,
+    stride: int,
+    max_windows: int,
+    replacement_method: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    baseline_pred_df = run_prediction(
+        pipeline=pipeline,
+        context_df=context_df,
+        future_df=future_df,
+        prediction_length=prediction_length,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+        target_column=target_column,
+    )
+    baseline_forecast = extract_selected_point_forecast(
+        pred_df=baseline_pred_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+        selected_id=selected_id,
+    ).rename(columns={"prediction": "baseline_prediction"})
+
+    if input_source == INFLUENCE_SOURCE_CONTEXT:
+        source_df = context_df
+    elif future_df is not None and not future_df.empty:
+        source_df = future_df
+    else:
+        raise ValueError("미래 공변량 입력이 없습니다.")
+
+    windows = build_influence_windows(
+        source_df=source_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+        selected_id=selected_id,
+        input_source=input_source,
+        analysis_length=analysis_length,
+        window_size=window_size,
+        stride=stride,
+        max_windows=max_windows,
+    )
+    if not windows:
+        raise ValueError("영향도 분석에 사용할 window가 없습니다.")
+
+    influence_rows: list[dict[str, object]] = []
+    for window in windows:
+        perturbed_context_df = context_df
+        perturbed_future_df = future_df
+        if input_source == INFLUENCE_SOURCE_CONTEXT:
+            perturbed_context_df = perturb_series_window(
+                df=context_df,
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                selected_id=selected_id,
+                perturb_column=perturb_column,
+                start_idx=int(window["start_idx"]),
+                end_idx=int(window["end_idx"]),
+                replacement_method=replacement_method,
+            )
+        else:
+            perturbed_future_df = perturb_series_window(
+                df=future_df if future_df is not None else pd.DataFrame(),
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                selected_id=selected_id,
+                perturb_column=perturb_column,
+                start_idx=int(window["start_idx"]),
+                end_idx=int(window["end_idx"]),
+                replacement_method=replacement_method,
+            )
+
+        perturbed_pred_df = run_prediction(
+            pipeline=pipeline,
+            context_df=perturbed_context_df,
+            future_df=perturbed_future_df,
+            prediction_length=prediction_length,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+            target_column=target_column,
+        )
+        perturbed_forecast = extract_selected_point_forecast(
+            pred_df=perturbed_pred_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+            selected_id=selected_id,
+        ).rename(columns={"prediction": "perturbed_prediction"})
+
+        merged = baseline_forecast.merge(
+            perturbed_forecast[[timestamp_column, "perturbed_prediction"]],
+            on=timestamp_column,
+            how="inner",
+        )
+        for _, row in merged.iterrows():
+            delta = float(row["perturbed_prediction"] - row["baseline_prediction"])
+            influence_rows.append(
+                {
+                    "input_source": input_source,
+                    "input_column": perturb_column,
+                    "selected_id": selected_id,
+                    "window_label": window["window_label"],
+                    "window_time_range": window["window_time_range"],
+                    "start_idx": int(window["start_idx"]),
+                    "end_idx": int(window["end_idx"]),
+                    "horizon_index": int(row["horizon_index"]),
+                    "horizon_label": row["horizon_label"],
+                    "forecast_timestamp": row[timestamp_column],
+                    "baseline_prediction": float(row["baseline_prediction"]),
+                    "perturbed_prediction": float(row["perturbed_prediction"]),
+                    "delta": delta,
+                    "abs_delta": abs(delta),
+                }
+            )
+
+    if not influence_rows:
+        raise ValueError("baseline과 perturb 예측의 timestamp가 맞지 않아 influence를 계산하지 못했습니다.")
+
+    return pd.DataFrame(influence_rows), baseline_forecast
+
+
+def summarize_influence_windows(influence_df: pd.DataFrame) -> pd.DataFrame:
+    if influence_df.empty:
+        return pd.DataFrame()
+
+    summary = (
+        influence_df.groupby(
+            ["window_label", "window_time_range", "start_idx", "end_idx"],
+            dropna=False,
+        )
+        .agg(
+            mean_abs_delta=("abs_delta", "mean"),
+            max_abs_delta=("abs_delta", "max"),
+            mean_delta=("delta", "mean"),
+        )
+        .reset_index()
+        .sort_values("mean_abs_delta", ascending=False)
+    )
+    return summary
+
+
+def build_influence_heatmap(influence_df: pd.DataFrame, value_column: str) -> go.Figure:
+    window_order = (
+        influence_df[["window_label", "start_idx"]]
+        .drop_duplicates()
+        .sort_values("start_idx")["window_label"]
+        .tolist()
+    )
+    horizon_order = (
+        influence_df[["horizon_label", "horizon_index"]]
+        .drop_duplicates()
+        .sort_values("horizon_index")["horizon_label"]
+        .tolist()
+    )
+    matrix = (
+        influence_df.pivot_table(
+            index="window_label",
+            columns="horizon_label",
+            values=value_column,
+            aggfunc="mean",
+        )
+        .reindex(index=window_order, columns=horizon_order)
+        .iloc[::-1]
+    )
+
+    heatmap_args = {
+        "z": matrix.values,
+        "x": matrix.columns.tolist(),
+        "y": matrix.index.tolist(),
+        "colorscale": "YlOrRd" if value_column == "abs_delta" else "RdBu_r",
+        "colorbar": {"title": value_column},
+        "hovertemplate": "window=%{y}<br>horizon=%{x}<br>value=%{z:.6g}<extra></extra>",
+    }
+    if value_column == "delta":
+        heatmap_args["zmid"] = 0
+
+    figure = go.Figure(data=go.Heatmap(**heatmap_args))
+    figure.update_layout(
+        height=max(360, min(760, 120 + 32 * len(matrix.index))),
+        margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        xaxis_title="forecast horizon",
+        yaxis_title="perturbed input window",
+    )
+    return figure
+
+
+def build_influence_forecast_comparison(
+    influence_df: pd.DataFrame,
+    selected_window_label: str,
+) -> go.Figure:
+    selected_rows = influence_df.loc[influence_df["window_label"] == selected_window_label].copy()
+    selected_rows["forecast_timestamp"] = pd.to_datetime(selected_rows["forecast_timestamp"], errors="coerce")
+    selected_rows = selected_rows.sort_values("horizon_index")
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=selected_rows["forecast_timestamp"],
+            y=selected_rows["baseline_prediction"],
+            mode="lines+markers",
+            name="baseline",
+            line={"color": "#264653", "width": 2},
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=selected_rows["forecast_timestamp"],
+            y=selected_rows["perturbed_prediction"],
+            mode="lines+markers",
+            name="perturbed",
+            line={"color": "#e76f51", "width": 2},
+        )
+    )
+    figure.update_layout(
+        height=340,
+        margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        legend={"orientation": "h"},
+    )
+    return figure
+
+
+def run_forecast_weekday_comparison(
+    pipeline,
+    baseline_pred_df: pd.DataFrame,
+    model_context_df: pd.DataFrame,
+    model_future_df: pd.DataFrame | None,
+    actual_future_df: pd.DataFrame | None,
+    prediction_length: int,
+    id_column: str,
+    timestamp_column: str,
+    target_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    pred_frames: list[pd.DataFrame] = []
+    metric_frames: list[pd.DataFrame] = []
+    error_rows: list[dict[str, object]] = []
+
+    def append_prediction(
+        pred_df: pd.DataFrame,
+        scenario: str,
+        weekday_encoding: str,
+        weekday_scope: str,
+    ) -> None:
+        prepared_pred = pred_df.copy()
+        prepared_pred["scenario"] = scenario
+        prepared_pred["weekday_encoding"] = weekday_encoding
+        prepared_pred["weekday_scope"] = weekday_scope
+        pred_frames.append(prepared_pred)
+
+        if actual_future_df is None or actual_future_df.empty:
+            return
+
+        metrics = compute_metrics(
+            pred_df=pred_df,
+            history_df=model_context_df,
+            actual_df=actual_future_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+            target_column=target_column,
+        )
+        metrics["scenario"] = scenario
+        metrics["weekday_encoding"] = weekday_encoding
+        metrics["weekday_scope"] = weekday_scope
+        metric_frames.append(metrics)
+
+    append_prediction(
+        pred_df=baseline_pred_df,
+        scenario=WEEKDAY_BASELINE_SCENARIO,
+        weekday_encoding="無",
+        weekday_scope="無",
+    )
+
+    for encoding in WEEKDAY_ENCODINGS:
+        for scope_name, include_future_covariate in WEEKDAY_COVARIATE_SCOPES:
+            scenario_name = build_weekday_scenario_name(encoding, include_future_covariate)
+            try:
+                scenario_context_df, scenario_future_df = prepare_weekday_forecast_inputs(
+                    model_context_df=model_context_df,
+                    model_future_df=model_future_df,
+                    actual_future_df=actual_future_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    prediction_length=prediction_length,
+                    encoding=encoding,
+                    include_future_covariate=include_future_covariate,
+                )
+                scenario_pred_df = run_prediction(
+                    pipeline=pipeline,
+                    context_df=scenario_context_df,
+                    future_df=scenario_future_df,
+                    prediction_length=prediction_length,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    target_column=target_column,
+                )
+                append_prediction(
+                    pred_df=scenario_pred_df,
+                    scenario=scenario_name,
+                    weekday_encoding=WEEKDAY_ENCODING_LABELS.get(encoding, encoding),
+                    weekday_scope=scope_name,
+                )
+            except Exception as exc:
+                error_rows.append(
+                    {
+                        "scenario": scenario_name,
+                        "weekday_encoding": WEEKDAY_ENCODING_LABELS.get(encoding, encoding),
+                        "weekday_scope": scope_name,
+                        "error": str(exc),
+                    }
+                )
+
+    comparison_pred_df = pd.concat(pred_frames, ignore_index=True) if pred_frames else pd.DataFrame()
+    comparison_metrics_df = pd.concat(metric_frames, ignore_index=True) if metric_frames else pd.DataFrame()
+    comparison_errors_df = pd.DataFrame(error_rows)
+    return comparison_pred_df, comparison_metrics_df, comparison_errors_df
+
+
+def build_forecast_weekday_metric_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if metrics_df.empty or "scenario" not in metrics_df.columns:
+        return metrics_df
+
+    metric_columns = ["MAE", "RMSE", "MAPE", "MASE", "Correlation"]
+    available_metrics = [col for col in metric_columns if col in metrics_df.columns]
+    summary_df = metrics_df[["scenario", "weekday_encoding", "weekday_scope", *available_metrics]].copy()
+    baseline_rows = summary_df.loc[summary_df["scenario"] == WEEKDAY_BASELINE_SCENARIO]
+    if baseline_rows.empty:
+        return summary_df
+
+    baseline = baseline_rows.iloc[0]
+    for metric in available_metrics:
+        summary_df[f"{metric}_delta"] = summary_df[metric] - baseline[metric]
+    return summary_df
+
+
+def build_forecast_weekday_comparison_plot(
+    history_df: pd.DataFrame,
+    comparison_pred_df: pd.DataFrame,
+    actual_future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+    target_column: str,
+    selected_id: str,
+    selected_scenarios: list[str],
+) -> go.Figure:
+    history = history_df.loc[
+        history_df[id_column].astype(str) == selected_id,
+        [timestamp_column, target_column],
+    ].copy()
+    history[timestamp_column] = pd.to_datetime(history[timestamp_column], errors="coerce")
+    history = history.sort_values(timestamp_column)
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scattergl(
+            x=history[timestamp_column],
+            y=history[target_column],
+            mode="lines",
+            name="history",
+            line={"color": "#264653", "width": 2},
+        )
+    )
+
+    if actual_future_df is not None and not actual_future_df.empty:
+        actual_future = actual_future_df.loc[
+            actual_future_df[id_column].astype(str) == selected_id,
+            [timestamp_column, target_column],
+        ].copy()
+        actual_future[timestamp_column] = pd.to_datetime(actual_future[timestamp_column], errors="coerce")
+        actual_future = actual_future.sort_values(timestamp_column)
+        figure.add_trace(
+            go.Scattergl(
+                x=actual_future[timestamp_column],
+                y=actual_future[target_column],
+                mode="lines",
+                name="actual_future",
+                line={"color": "#2a9d8f", "width": 2},
+            )
+        )
+
+    for scenario in selected_scenarios:
+        scenario_pred_df = comparison_pred_df.loc[
+            (comparison_pred_df["scenario"].astype(str) == scenario)
+            & (comparison_pred_df[id_column].astype(str) == selected_id)
+        ].copy()
+        if scenario_pred_df.empty:
+            continue
+
+        point_column = get_point_prediction_column(
+            pred_df=scenario_pred_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+        )
+        scenario_pred_df[timestamp_column] = pd.to_datetime(scenario_pred_df[timestamp_column], errors="coerce")
+        scenario_pred_df = scenario_pred_df.sort_values(timestamp_column)
+        figure.add_trace(
+            go.Scattergl(
+                x=scenario_pred_df[timestamp_column],
+                y=scenario_pred_df[point_column],
+                mode="lines",
+                name=scenario,
+                line={"color": get_weekday_scenario_color(scenario), "width": 2},
+            )
+        )
+
+    figure.update_layout(
+        height=520,
+        margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        legend={"orientation": "h"},
+    )
+    return figure
+
+
 def build_sliding_windows(
     context_df: pd.DataFrame,
     future_df: pd.DataFrame | None,
@@ -627,10 +1365,19 @@ def build_sliding_windows(
     lengths = prepared.groupby(id_column).size()
     if lengths.empty:
         raise ValueError("슬라이딩 검증을 수행할 데이터가 없습니다.")
+    if stride < 1:
+        raise ValueError("윈도우 간격은 1 이상이어야 합니다.")
     if lengths.min() < context_length + prediction_length:
+        min_length = int(lengths.min())
+        required_length = int(context_length + prediction_length)
+        shortest_id = str(lengths.idxmin())
+        max_context_length = max(0, min_length - prediction_length)
         raise ValueError(
             "선택한 데이터 길이가 부족합니다. "
-            f"각 시계열은 최소 {context_length + prediction_length}개 이상이어야 합니다."
+            f"현재 선택 구간의 최소 시계열 길이는 {min_length}개(`{shortest_id}`)이고, "
+            f"현재 검증 설정은 최소 {required_length}개"
+            f"({context_length} history + {prediction_length} forecast)가 필요합니다. "
+            f"검증용 과거 길이를 {max_context_length} 이하로 줄이거나 분석 구간을 늘려주세요."
         )
 
     prepared_future = None
@@ -673,6 +1420,25 @@ def build_sliding_windows(
             break
 
     return windows
+
+
+def estimate_sliding_window_count(
+    series_length: int,
+    context_length: int,
+    prediction_length: int,
+    stride: int,
+    max_windows: int | None = None,
+) -> int:
+    if series_length < 1 or stride < 1:
+        return 0
+    max_start = series_length - context_length - prediction_length
+    if max_start < 0:
+        return 0
+
+    window_count = (max_start // stride) + 1
+    if max_windows is not None:
+        return min(window_count, max_windows)
+    return window_count
 
 
 def run_sliding_window_validation(
@@ -773,15 +1539,15 @@ def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> 
         return pd.DataFrame()
 
     grouped = validation_windows_df.groupby("scenario", dropna=False)[metric_columns].mean().reset_index()
-    if "요일 미사용" not in set(grouped["scenario"]):
+    if WEEKDAY_BASELINE_SCENARIO not in set(grouped["scenario"]):
         return grouped
 
-    baseline = grouped.loc[grouped["scenario"] == "요일 미사용"].iloc[0]
+    baseline = grouped.loc[grouped["scenario"] == WEEKDAY_BASELINE_SCENARIO].iloc[0]
     comparison_rows: list[dict[str, object]] = []
 
     for _, scenario_row in grouped.iterrows():
         scenario_name = str(scenario_row["scenario"])
-        if scenario_name == "요일 미사용":
+        if scenario_name == WEEKDAY_BASELINE_SCENARIO:
             continue
         for metric in metric_columns:
             delta = float(scenario_row[metric] - baseline[metric])
@@ -793,7 +1559,7 @@ def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> 
                 {
                     "scenario": scenario_name,
                     "metric": metric,
-                    "요일 미사용": float(baseline[metric]),
+                    WEEKDAY_BASELINE_SCENARIO: float(baseline[metric]),
                     "비교 시나리오": float(scenario_row[metric]),
                     "delta": delta,
                     "판정": better,
@@ -816,7 +1582,7 @@ def show_top_status(
 
     col1, col2, col3 = st.columns(3)
     col1.metric("시계열 수", series_count)
-    col2.metric("예측 구간 길이", int(prediction_length))
+    col2.metric("전역 예측 구간 길이", int(prediction_length))
     col3.metric("실행 장치", device)
 
 
@@ -1080,41 +1846,29 @@ with tabs[0]:
         exec_col1.metric("모델 ID", model_id)
         exec_col2.metric("실행 장치", device)
         exec_col3.metric("예측 구간 길이", int(prediction_length))
+        compare_forecast_weekday_covariate = st.checkbox(
+            "요일 공변량 Forecast 비교",
+            value=False,
+            help=(
+                "기본 예측과 함께 문자열, 0~6, sin/cos 요일 인코딩을 "
+                "`과거만`/`과거+미래` 범위로 모두 비교합니다."
+            ),
+        )
+        if compare_forecast_weekday_covariate:
+            st.caption("baseline 1회 + 요일 인코딩 3종 x 적용 범위 2종으로 최대 7개 forecast를 실행합니다.")
 
         if st.button("Chronos-2 예측 실행", type="primary", disabled=not can_run):
             try:
                 with st.spinner("모델을 불러오고 예측하는 중입니다..."):
                     pipeline = get_pipeline(model_id, device)
-                    model_context_df = trim_context_to_model_limit(
+                    model_context_df, model_future_df, actual_future_df = prepare_model_inputs_for_forecast(
                         context_df=context_df,
+                        full_context_df=full_context_df,
+                        future_df=future_df,
                         id_column=id_column,
                         timestamp_column=timestamp_column,
-                    )
-                    model_future_df = future_df
-                    actual_future_df = None
-
-                    if experiment_mode == "데이터셋 내부 평가":
-                        model_context_df, actual_future_df, model_future_df = build_evaluation_split(
-                            context_df=context_df,
-                            future_df=future_df,
-                            id_column=id_column,
-                            timestamp_column=timestamp_column,
-                            prediction_length=int(prediction_length),
-                        )
-                    elif experiment_mode == "선택 구간 끝에서 미래 예측":
-                        actual_future_df, model_future_df = build_future_comparison_split(
-                            full_context_df=full_context_df,
-                            model_context_df=model_context_df,
-                            future_df=future_df,
-                            id_column=id_column,
-                            timestamp_column=timestamp_column,
-                            prediction_length=int(prediction_length),
-                        )
-
-                    model_context_df = trim_context_to_model_limit(
-                        context_df=model_context_df,
-                        id_column=id_column,
-                        timestamp_column=timestamp_column,
+                        prediction_length=int(prediction_length),
+                        experiment_mode=experiment_mode,
                     )
 
                     st.session_state["pred_df"] = run_prediction(
@@ -1145,6 +1899,30 @@ with tabs[0]:
                         )
                     else:
                         st.session_state["metrics_df"] = None
+
+                    if compare_forecast_weekday_covariate:
+                        (
+                            weekday_comparison_pred_df,
+                            weekday_comparison_metrics_df,
+                            weekday_comparison_errors_df,
+                        ) = run_forecast_weekday_comparison(
+                            pipeline=pipeline,
+                            baseline_pred_df=st.session_state["pred_df"],
+                            model_context_df=model_context_df,
+                            model_future_df=model_future_df,
+                            actual_future_df=actual_future_df,
+                            prediction_length=int(prediction_length),
+                            id_column=id_column,
+                            timestamp_column=timestamp_column,
+                            target_column=target_column,
+                        )
+                        st.session_state["forecast_weekday_comparison_pred_df"] = weekday_comparison_pred_df
+                        st.session_state["forecast_weekday_comparison_metrics_df"] = weekday_comparison_metrics_df
+                        st.session_state["forecast_weekday_comparison_errors_df"] = weekday_comparison_errors_df
+                    else:
+                        st.session_state["forecast_weekday_comparison_pred_df"] = None
+                        st.session_state["forecast_weekday_comparison_metrics_df"] = None
+                        st.session_state["forecast_weekday_comparison_errors_df"] = None
 
                 st.success("예측이 완료되었습니다.")
             except Exception as exc:
@@ -1188,6 +1966,60 @@ with tabs[0]:
                 )
                 save_predictions_download(pred_df)
 
+        weekday_comparison_pred_df = st.session_state.get("forecast_weekday_comparison_pred_df")
+        weekday_comparison_metrics_df = st.session_state.get("forecast_weekday_comparison_metrics_df")
+        weekday_comparison_errors_df = st.session_state.get("forecast_weekday_comparison_errors_df")
+        if isinstance(weekday_comparison_pred_df, pd.DataFrame) and not weekday_comparison_pred_df.empty:
+            with st.container(border=True):
+                st.markdown("**요일 공변량 Forecast 비교**")
+                if (
+                    isinstance(weekday_comparison_metrics_df, pd.DataFrame)
+                    and not weekday_comparison_metrics_df.empty
+                ):
+                    st.dataframe(
+                        build_forecast_weekday_metric_summary(weekday_comparison_metrics_df),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("실측 미래 구간이 없어서 시나리오별 평가 지표는 계산하지 않았습니다.")
+
+                if (
+                    isinstance(weekday_comparison_errors_df, pd.DataFrame)
+                    and not weekday_comparison_errors_df.empty
+                ):
+                    st.warning("일부 요일 공변량 시나리오는 실행하지 못했습니다.")
+                    st.dataframe(weekday_comparison_errors_df, use_container_width=True)
+
+                comparison_col1, comparison_col2 = st.columns([0.35, 0.65])
+                comparison_ids = result_meta["history_df"][result_meta["id_column"]].astype(str).unique().tolist()
+                selected_comparison_id = comparison_col1.selectbox(
+                    "비교 시계열",
+                    options=comparison_ids,
+                    key="forecast_weekday_comparison_id",
+                )
+                scenario_options = weekday_comparison_pred_df["scenario"].dropna().astype(str).unique().tolist()
+                selected_comparison_scenarios = comparison_col2.multiselect(
+                    "비교 시나리오",
+                    options=scenario_options,
+                    default=scenario_options,
+                    key="forecast_weekday_comparison_scenarios",
+                )
+                if selected_comparison_scenarios:
+                    comparison_figure = build_forecast_weekday_comparison_plot(
+                        history_df=result_meta["history_df"],
+                        comparison_pred_df=weekday_comparison_pred_df,
+                        actual_future_df=result_meta["actual_future_df"],
+                        id_column=result_meta["id_column"],
+                        timestamp_column=result_meta["timestamp_column"],
+                        target_column=result_meta["target_column"],
+                        selected_id=selected_comparison_id,
+                        selected_scenarios=selected_comparison_scenarios,
+                    )
+                    st.plotly_chart(comparison_figure, use_container_width=True)
+
+                with st.expander("요일 공변량 비교 예측 데이터"):
+                    st.dataframe(weekday_comparison_pred_df, use_container_width=True)
+
 with tabs[1]:
     st.subheader("Validation")
     st.caption("현재 준비된 데이터 구간으로 슬라이딩 윈도우 검증을 수행합니다.")
@@ -1200,23 +2032,53 @@ with tabs[1]:
         timestamp_column=timestamp_column,
     )
 
+    validation_lengths = pd.Series(dtype="int64")
+    validation_min_length = 0
+    if can_run and id_column and timestamp_column:
+        validation_lengths = get_series_lengths(
+            context_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+        )
+        if not validation_lengths.empty:
+            validation_min_length = int(validation_lengths.min())
+
     val_cfg_col1, val_cfg_col2 = st.columns(2)
     with val_cfg_col1:
         with st.container(border=True):
             st.markdown("**1. 검증 설정**")
-            validation_context_length = st.number_input(
-                "검증용 과거 길이",
-                min_value=8,
-                max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
-                value=min(168, CHRONOS2_MAX_CONTEXT_LENGTH),
-                step=8,
-            )
+            validation_min_context_length = 8
+            validation_prediction_max = CHRONOS2_MAX_PREDICTION_LENGTH
+            if validation_min_length > 0:
+                validation_prediction_max = min(
+                    CHRONOS2_MAX_PREDICTION_LENGTH,
+                    max(1, validation_min_length - validation_min_context_length),
+                )
+            validation_prediction_default = min(int(prediction_length), int(validation_prediction_max))
             validation_prediction_length = st.number_input(
                 "검증용 예측 구간 길이",
                 min_value=1,
-                max_value=CHRONOS2_MAX_PREDICTION_LENGTH,
-                value=int(prediction_length),
+                max_value=int(validation_prediction_max),
+                value=int(validation_prediction_default),
                 step=1,
+            )
+
+            validation_context_max = CHRONOS2_MAX_CONTEXT_LENGTH
+            if validation_min_length > 0:
+                validation_context_max = min(
+                    CHRONOS2_MAX_CONTEXT_LENGTH,
+                    max(
+                        validation_min_context_length,
+                        validation_min_length - int(validation_prediction_length),
+                    ),
+                )
+            validation_context_default = min(168, int(validation_context_max))
+            validation_context_length = st.number_input(
+                "검증용 과거 길이",
+                min_value=validation_min_context_length,
+                max_value=int(validation_context_max),
+                value=int(validation_context_default),
+                step=8,
             )
             validation_stride = st.number_input(
                 "윈도우 간격",
@@ -1233,13 +2095,35 @@ with tabs[1]:
                 step=1,
             )
             max_windows = None if int(max_windows_input) == 0 else int(max_windows_input)
+
+            validation_required_length = int(validation_context_length) + int(validation_prediction_length)
+            validation_ready = bool(can_run and validation_min_length >= validation_required_length)
+            estimated_validation_windows = estimate_sliding_window_count(
+                series_length=validation_min_length,
+                context_length=int(validation_context_length),
+                prediction_length=int(validation_prediction_length),
+                stride=int(validation_stride),
+                max_windows=max_windows,
+            )
+            status_col1, status_col2, status_col3 = st.columns(3)
+            status_col1.metric("선택 구간 최소 길이", int(validation_min_length))
+            status_col2.metric("필요 길이", int(validation_required_length))
+            status_col3.metric("예상 윈도우 수", int(estimated_validation_windows))
+            if can_run and not validation_ready:
+                st.warning(
+                    "현재 검증 설정을 실행하려면 선택 구간을 더 길게 잡거나 "
+                    "검증용 과거 길이 또는 검증용 예측 구간 길이를 줄여주세요."
+                )
     with val_cfg_col2:
         with st.container(border=True):
             st.markdown("**2. 비교 옵션**")
             compare_weekday_covariate = st.checkbox(
                 "요일 공변량 A/B 비교",
                 value=False,
-                help="timestamp에서 요일을 자동 생성해 `요일 미사용`, `과거 요일 유`, `과거+미래 요일 유`를 비교합니다.",
+                help=(
+                    f"timestamp에서 요일을 자동 생성해 `{WEEKDAY_BASELINE_SCENARIO}`와 "
+                    "`曜日-有(인코딩,過去/過去+未来)`를 비교합니다."
+                ),
             )
             if compare_weekday_covariate:
                 selected_weekday_encoding = st.selectbox(
@@ -1248,13 +2132,18 @@ with tabs[1]:
                     index=0,
                     help="한 번에 한 가지 인코딩을 고르고, 적용 범위만 3가지 시나리오로 비교합니다.",
                 )
-                st.caption("기준선은 `요일 미사용`이고, 같은 인코딩으로 `과거만`과 `과거+미래`를 함께 비교합니다.")
+                st.caption(
+                    f"기준선은 `{WEEKDAY_BASELINE_SCENARIO}`이고, 같은 인코딩으로 "
+                    "`過去`와 `過去+未来`를 함께 비교합니다."
+                )
             else:
                 st.caption(
                     "선택하면 기본 검증 외에도 요일 정보를 covariate로 추가한 시나리오를 함께 계산합니다."
                 )
 
-    if st.button("슬라이딩 윈도우 검증 실행", type="primary", disabled=not can_run):
+    validation_can_run = bool(can_run and validation_ready)
+
+    if st.button("슬라이딩 윈도우 검증 실행", type="primary", disabled=not validation_can_run):
         try:
             with st.spinner("슬라이딩 윈도우 검증을 수행하는 중입니다..."):
                 pipeline = get_pipeline(model_id, device)
@@ -1275,19 +2164,19 @@ with tabs[1]:
                 validation_history_df = validation_history_df.copy()
                 validation_pred_df = validation_pred_df.copy()
                 validation_actual_df = validation_actual_df.copy()
-                summary_df["scenario"] = "요일 미사용"
-                windows_df["scenario"] = "요일 미사용"
-                validation_history_df["scenario"] = "요일 미사용"
-                validation_pred_df["scenario"] = "요일 미사용"
-                validation_actual_df["scenario"] = "요일 미사용"
+                summary_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                windows_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                validation_history_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                validation_pred_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                validation_actual_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
 
                 comparison_summary_df = pd.DataFrame()
                 if compare_weekday_covariate:
-                    weekday_scenarios = [
-                        ("과거 요일 유", False),
-                        ("과거+미래 요일 유", True),
-                    ]
-                    for scenario_name, include_future_covariate in weekday_scenarios:
+                    for _, include_future_covariate in WEEKDAY_COVARIATE_SCOPES:
+                        scenario_name = build_weekday_scenario_name(
+                            selected_weekday_encoding,
+                            include_future_covariate,
+                        )
                         weekday_context_df, weekday_future_df = build_weekday_covariate_frames(
                             context_df=context_df,
                             future_df=future_df,
@@ -1345,7 +2234,9 @@ with tabs[1]:
     if isinstance(validation_summary_df, pd.DataFrame) and not validation_summary_df.empty:
         with st.container(border=True):
             st.markdown("**검증 요약**")
-            base_summary_df = validation_summary_df.loc[validation_summary_df["scenario"] == "요일 미사용"]
+            base_summary_df = validation_summary_df.loc[
+                validation_summary_df["scenario"] == WEEKDAY_BASELINE_SCENARIO
+            ]
             if not base_summary_df.empty:
                 show_validation_cards(base_summary_df)
             st.dataframe(validation_summary_df, use_container_width=True)
@@ -1360,11 +2251,6 @@ with tabs[1]:
             )
             trend_fig = go.Figure()
             if "scenario" in validation_windows_df.columns:
-                line_colors = {
-                    "요일 미사용": "#1d3557",
-                    "과거 요일 유": "#e76f51",
-                    "과거+미래 요일 유": "#2a9d8f",
-                }
                 for scenario_name, group in validation_windows_df.groupby("scenario", dropna=False):
                     group = group.sort_values("window_index")
                     trend_fig.add_trace(
@@ -1373,7 +2259,7 @@ with tabs[1]:
                             y=group[metric_for_plot],
                             mode="lines+markers",
                             name=str(scenario_name),
-                            line={"color": line_colors.get(str(scenario_name), "#457b9d"), "width": 2},
+                            line={"color": get_weekday_scenario_color(str(scenario_name)), "width": 2},
                         )
                     )
             else:
@@ -1468,35 +2354,250 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Covariate Lab")
-    st.caption("선택한 공변량을 변형해 예측 민감도를 비교하는 실험 공간입니다. 현재는 준비 단계입니다.")
-    preview_tag_col1, preview_tag_col2 = st.columns([0.2, 0.8])
-    preview_tag_col1.markdown("`Preview`")
-    preview_tag_col2.write("")
+    st.caption("선택한 입력 구간을 perturb해서 예측 민감도와 attention-like influence를 확인합니다.")
+
+    influence_context_df = pd.DataFrame()
+    influence_future_df = None
+    influence_actual_future_df = None
+    influence_inputs_ready = False
+    influence_input_error = ""
 
     if can_run:
-        with st.container(border=True):
-            st.markdown("**현재 입력 요약**")
-            show_model_input_summary(
-                context_df=trim_context_to_model_limit(
-                    context_df=context_df,
-                    id_column=id_column,
-                    timestamp_column=timestamp_column,
-                ),
+        try:
+            influence_context_df, influence_future_df, influence_actual_future_df = prepare_model_inputs_for_forecast(
+                context_df=context_df,
+                full_context_df=full_context_df,
                 future_df=future_df,
                 id_column=id_column,
                 timestamp_column=timestamp_column,
-                target_column=target_column,
+                prediction_length=int(prediction_length),
+                experiment_mode=experiment_mode,
             )
+            influence_inputs_ready = True
+        except Exception as exc:
+            influence_input_error = str(exc)
+
+        with st.container(border=True):
+            st.markdown("**현재 입력 요약**")
+            if influence_inputs_ready:
+                show_model_input_summary(
+                    context_df=influence_context_df,
+                    future_df=influence_future_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    target_column=target_column,
+                )
+            else:
+                st.warning(f"현재 설정으로 모델 입력을 만들 수 없습니다: {influence_input_error}")
+    else:
+        st.info("과거 데이터를 업로드하면 Covariate Lab을 사용할 수 있습니다.")
 
     with st.container(border=True):
-        st.markdown("**준비 중인 실험**")
-        st.markdown(
-            "- 공변량 shuffle 비교\n"
-            "- 평균값 고정(mean-fix) 비교\n"
-            "- scale perturbation 비교\n"
-            "- 개별 covariate 제거 ablation"
-        )
-        st.info(
-            "다음 단계로는 선택한 covariate를 shuffle, mean-fix, scale 변형해서 원본 예측과 비교하는 "
-            "counterfactual 분석을 붙이는 것이 가장 좋습니다."
-        )
+        st.markdown("**Attention-like Influence Map**")
+
+        if not can_run:
+            st.info("Forecast 탭에서 과거 데이터를 먼저 준비해주세요.")
+        elif not influence_inputs_ready:
+            st.warning(f"현재 설정으로 influence map을 계산할 수 없습니다: {influence_input_error}")
+        else:
+            influence_ids = influence_context_df[id_column].astype(str).drop_duplicates().tolist()
+            input_source_options = [INFLUENCE_SOURCE_CONTEXT]
+            if influence_future_df is not None and not influence_future_df.empty:
+                input_source_options.append(INFLUENCE_SOURCE_FUTURE)
+
+            cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
+            selected_influence_id = cfg_col1.selectbox(
+                "분석 시계열",
+                options=influence_ids,
+                key="influence_selected_id",
+            )
+            selected_input_source = cfg_col2.selectbox(
+                "입력 소스",
+                options=input_source_options,
+                key="influence_input_source",
+            )
+
+            if selected_input_source == INFLUENCE_SOURCE_CONTEXT:
+                source_df = influence_context_df
+                context_feature_columns = [
+                    col for col in influence_context_df.columns if col not in {id_column, timestamp_column}
+                ]
+                source_columns = []
+                if target_column in context_feature_columns:
+                    source_columns.append(target_column)
+                source_columns.extend([col for col in context_feature_columns if col != target_column])
+                source_key = "context"
+            else:
+                source_df = influence_future_df if influence_future_df is not None else pd.DataFrame()
+                source_columns = [
+                    col for col in source_df.columns if col not in {id_column, timestamp_column, target_column}
+                ]
+                source_key = "future"
+
+            if not source_columns:
+                st.info("선택한 입력 소스에는 perturb할 수 있는 컬럼이 없습니다.")
+            else:
+                perturb_column = cfg_col3.selectbox(
+                    "Perturb 컬럼",
+                    options=source_columns,
+                    key=f"influence_perturb_column_{source_key}",
+                )
+                try:
+                    source_series = get_series_rows_for_influence(
+                        df=source_df,
+                        id_column=id_column,
+                        timestamp_column=timestamp_column,
+                        selected_id=selected_influence_id,
+                    )
+                    source_length = int(len(source_series))
+                except Exception as exc:
+                    source_series = pd.DataFrame()
+                    source_length = 0
+                    st.warning(f"선택한 입력 소스에서 시계열을 찾지 못했습니다: {exc}")
+
+                if source_length > 0:
+                    analysis_default = min(
+                        168 if selected_input_source == INFLUENCE_SOURCE_CONTEXT else int(prediction_length),
+                        source_length,
+                    )
+                    window_default = (
+                        min(24, analysis_default)
+                        if selected_input_source == INFLUENCE_SOURCE_CONTEXT
+                        else max(1, analysis_default)
+                    )
+
+                    opt_col1, opt_col2, opt_col3, opt_col4 = st.columns(4)
+                    analysis_length = opt_col1.number_input(
+                        "분석 입력 길이",
+                        min_value=1,
+                        max_value=source_length,
+                        value=int(max(1, analysis_default)),
+                        step=1,
+                        key=f"influence_analysis_length_{source_key}",
+                    )
+                    window_size = opt_col2.number_input(
+                        "Perturb window",
+                        min_value=1,
+                        max_value=int(analysis_length),
+                        value=int(max(1, min(window_default, int(analysis_length)))),
+                        step=1,
+                        key=f"influence_window_size_{source_key}",
+                    )
+                    stride = opt_col3.number_input(
+                        "Window 간격",
+                        min_value=1,
+                        max_value=int(analysis_length),
+                        value=int(max(1, min(int(window_size), int(analysis_length)))),
+                        step=1,
+                        key=f"influence_stride_{source_key}",
+                    )
+                    max_windows = opt_col4.number_input(
+                        "최대 window 수",
+                        min_value=1,
+                        max_value=100,
+                        value=12,
+                        step=1,
+                        key=f"influence_max_windows_{source_key}",
+                    )
+
+                    replacement_method = st.selectbox(
+                        "Perturb 방식",
+                        options=["mean", "zero"],
+                        format_func=lambda value: "평균/최빈값 대체" if value == "mean" else "0 대체(숫자형)",
+                        key=f"influence_replacement_method_{source_key}",
+                    )
+
+                    preview_windows = build_influence_windows(
+                        source_df=source_df,
+                        id_column=id_column,
+                        timestamp_column=timestamp_column,
+                        selected_id=selected_influence_id,
+                        input_source=selected_input_source,
+                        analysis_length=int(analysis_length),
+                        window_size=int(window_size),
+                        stride=int(stride),
+                        max_windows=int(max_windows),
+                    )
+                    run_count_col1, run_count_col2, run_count_col3 = st.columns(3)
+                    run_count_col1.metric("분석 window 수", int(len(preview_windows)))
+                    run_count_col2.metric("예상 예측 호출", int(len(preview_windows) + 1))
+                    run_count_col3.metric("예측 horizon", int(prediction_length))
+
+                    if st.button("Influence map 계산", type="primary", disabled=not preview_windows):
+                        try:
+                            with st.spinner("Perturbation 기반 influence map을 계산하는 중입니다..."):
+                                pipeline = get_pipeline(model_id, device)
+                                influence_df, baseline_forecast_df = run_prediction_influence_analysis(
+                                    pipeline=pipeline,
+                                    context_df=influence_context_df,
+                                    future_df=influence_future_df,
+                                    prediction_length=int(prediction_length),
+                                    id_column=id_column,
+                                    timestamp_column=timestamp_column,
+                                    target_column=target_column,
+                                    selected_id=selected_influence_id,
+                                    input_source=selected_input_source,
+                                    perturb_column=perturb_column,
+                                    analysis_length=int(analysis_length),
+                                    window_size=int(window_size),
+                                    stride=int(stride),
+                                    max_windows=int(max_windows),
+                                    replacement_method=replacement_method,
+                                )
+                                st.session_state["influence_df"] = influence_df
+                                st.session_state["influence_baseline_forecast_df"] = baseline_forecast_df
+                                st.session_state["influence_meta"] = {
+                                    "series": selected_influence_id,
+                                    "source": selected_input_source,
+                                    "column": perturb_column,
+                                    "windows": int(len(preview_windows)),
+                                    "prediction_length": int(prediction_length),
+                                    "replacement_method": replacement_method,
+                                }
+                            st.success("Influence map 계산이 완료되었습니다.")
+                        except Exception as exc:
+                            st.error(f"Influence map 계산 중 오류가 발생했습니다: {exc}")
+
+                    influence_df = st.session_state.get("influence_df")
+                    influence_meta = st.session_state.get("influence_meta")
+                    if isinstance(influence_df, pd.DataFrame) and not influence_df.empty and influence_meta:
+                        st.markdown("**Influence Map 결과**")
+                        meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
+                        meta_col1.metric("시계열", str(influence_meta["series"]))
+                        meta_col2.metric("입력 소스", str(influence_meta["source"]))
+                        meta_col3.metric("컬럼", str(influence_meta["column"]))
+                        meta_col4.metric("window 수", int(influence_meta["windows"]))
+
+                        value_column = st.radio(
+                            "Heatmap 값",
+                            options=["abs_delta", "delta"],
+                            horizontal=True,
+                            format_func=lambda value: "변화량 크기" if value == "abs_delta" else "부호 있는 변화량",
+                            key="influence_heatmap_value",
+                        )
+                        st.plotly_chart(
+                            build_influence_heatmap(influence_df=influence_df, value_column=value_column),
+                            use_container_width=True,
+                        )
+
+                        influence_summary_df = summarize_influence_windows(influence_df)
+                        result_col1, result_col2 = st.columns([1.0, 1.2])
+                        with result_col1:
+                            st.markdown("**상위 영향 window**")
+                            st.dataframe(influence_summary_df.head(20), use_container_width=True)
+                        with result_col2:
+                            selected_window_label = st.selectbox(
+                                "예측 변화 비교 window",
+                                options=influence_summary_df["window_label"].tolist(),
+                                key="influence_comparison_window",
+                            )
+                            st.plotly_chart(
+                                build_influence_forecast_comparison(
+                                    influence_df=influence_df,
+                                    selected_window_label=selected_window_label,
+                                ),
+                                use_container_width=True,
+                            )
+
+                        with st.expander("Cell-level influence 데이터"):
+                            st.dataframe(influence_df, use_container_width=True)
