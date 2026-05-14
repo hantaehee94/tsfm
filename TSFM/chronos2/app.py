@@ -38,6 +38,10 @@ AUTO_ID_COLUMN = "__auto_id__"
 POINT_PREDICTION_COLUMN_CANDIDATES = ("predictions", 0.5, "0.5")
 INFLUENCE_SOURCE_CONTEXT = "과거 context"
 INFLUENCE_SOURCE_FUTURE = "미래 known covariate"
+VALIDATION_MODE_FIXED = "고정 길이"
+VALIDATION_MODE_LENGTH_SWEEP = "Context/Prediction 길이 Sweep"
+VALIDATION_MIN_CONTEXT_LENGTH = 8
+METRIC_COLUMNS = ["MAE", "RMSE", "MAPE", "MASE", "Correlation"]
 
 
 @st.cache_resource(show_spinner=False)
@@ -341,6 +345,140 @@ def compute_metrics(
             "Correlation": [float(np.nanmean(correlations)) if correlations else np.nan],
         }
     )
+
+
+def safe_mean(values: pd.Series) -> float:
+    numeric_values = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric_values.empty:
+        return np.nan
+    return float(numeric_values.mean())
+
+
+def compute_prediction_correlation(error_df: pd.DataFrame) -> float:
+    if error_df.empty:
+        return np.nan
+
+    paired = error_df[["prediction", "actual"]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(paired) < 2:
+        return np.nan
+
+    pred_std = float(paired["prediction"].std(ddof=0))
+    actual_std = float(paired["actual"].std(ddof=0))
+    if pred_std <= 1e-8 or actual_std <= 1e-8:
+        return np.nan
+
+    correlation = paired["prediction"].corr(paired["actual"])
+    return float(correlation) if pd.notna(correlation) else np.nan
+
+
+def summarize_error_metrics(error_df: pd.DataFrame) -> dict[str, float | int]:
+    if error_df.empty:
+        return {
+            "forecast_points": 0,
+            "MAE": np.nan,
+            "RMSE": np.nan,
+            "MAPE": np.nan,
+            "MASE": np.nan,
+            "Correlation": np.nan,
+        }
+
+    sq_error = pd.to_numeric(error_df["sq_error"], errors="coerce").dropna()
+    rmse = np.nan if sq_error.empty else float(np.sqrt(sq_error.mean()))
+    return {
+        "forecast_points": int(len(error_df)),
+        "MAE": safe_mean(error_df["abs_error"]),
+        "RMSE": rmse,
+        "MAPE": safe_mean(error_df["ape"]) * 100.0,
+        "MASE": safe_mean(error_df["scaled_abs_error"]),
+        "Correlation": compute_prediction_correlation(error_df),
+    }
+
+
+def aggregate_error_metrics(error_df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
+    if error_df.empty:
+        return pd.DataFrame(columns=[*group_columns, "forecast_points", *METRIC_COLUMNS])
+
+    rows: list[dict[str, object]] = []
+    for group_key, group in error_df.groupby(group_columns, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        row = dict(zip(group_columns, group_key))
+        row.update(summarize_error_metrics(group))
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_forecast_error_detail(
+    pred_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    id_column: str,
+    timestamp_column: str,
+    target_column: str,
+) -> pd.DataFrame:
+    point_column = get_point_prediction_column(
+        pred_df=pred_df,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+    )
+
+    pred_prepared = pred_df[[id_column, timestamp_column, point_column]].copy()
+    pred_prepared[timestamp_column] = pd.to_datetime(pred_prepared[timestamp_column], errors="coerce")
+    pred_prepared = pred_prepared.rename(columns={point_column: "prediction"})
+
+    actual_prepared = actual_df[[id_column, timestamp_column, target_column]].copy()
+    actual_prepared[timestamp_column] = pd.to_datetime(actual_prepared[timestamp_column], errors="coerce")
+    actual_prepared = actual_prepared.rename(columns={target_column: "actual"})
+
+    merged = pred_prepared.merge(actual_prepared, on=[id_column, timestamp_column], how="inner")
+    if merged.empty:
+        return pd.DataFrame(
+            columns=[
+                id_column,
+                timestamp_column,
+                "prediction",
+                "actual",
+                "horizon_index",
+                "horizon_label",
+                "abs_error",
+                "sq_error",
+                "ape",
+                "mase_scale",
+                "scaled_abs_error",
+            ]
+        )
+
+    merged = merged.sort_values([id_column, timestamp_column]).reset_index(drop=True)
+    merged["horizon_index"] = merged.groupby(id_column, dropna=False).cumcount() + 1
+    merged["horizon_label"] = merged["horizon_index"].map(lambda value: f"h+{int(value)}")
+    merged["prediction"] = pd.to_numeric(merged["prediction"], errors="coerce")
+    merged["actual"] = pd.to_numeric(merged["actual"], errors="coerce")
+    merged["abs_error"] = (merged["prediction"] - merged["actual"]).abs()
+    merged["sq_error"] = (merged["prediction"] - merged["actual"]) ** 2
+    merged["ape"] = np.where(
+        merged["actual"].abs() > 1e-8,
+        merged["abs_error"] / merged["actual"].abs(),
+        np.nan,
+    )
+
+    history_prepared = history_df[[id_column, timestamp_column, target_column]].copy()
+    history_prepared[timestamp_column] = pd.to_datetime(history_prepared[timestamp_column], errors="coerce")
+    history_prepared = history_prepared.sort_values([id_column, timestamp_column])
+    history_prepared["naive_abs_error"] = history_prepared.groupby(id_column)[target_column].diff().abs()
+    mase_scale = (
+        history_prepared.groupby(id_column, dropna=False)["naive_abs_error"]
+        .mean()
+        .rename("mase_scale")
+        .reset_index()
+    )
+    merged = merged.merge(mase_scale, on=id_column, how="left")
+    merged["scaled_abs_error"] = np.where(
+        merged["mase_scale"] > 1e-8,
+        merged["abs_error"] / merged["mase_scale"],
+        np.nan,
+    )
+    return merged
 
 
 def downsample_frame(df: pd.DataFrame, max_points: int = 2000) -> pd.DataFrame:
@@ -1224,12 +1362,237 @@ def run_sliding_window_validation(
     return summary_df, windows_df, history_detail_df, pred_detail_df, actual_detail_df
 
 
+def estimate_length_sweep_origin_count(
+    series_length: int,
+    max_context_length: int,
+    max_prediction_length: int,
+    stride: int,
+    max_windows: int | None = None,
+) -> int:
+    if series_length < 1 or stride < 1:
+        return 0
+
+    min_origin_idx = int(max_context_length)
+    max_origin_idx = int(series_length) - int(max_prediction_length)
+    if max_origin_idx < min_origin_idx:
+        return 0
+
+    origin_count = ((max_origin_idx - min_origin_idx) // int(stride)) + 1
+    if max_windows is not None:
+        return min(origin_count, max_windows)
+    return origin_count
+
+
+def estimate_length_sweep_call_count(
+    series_length: int,
+    min_context_length: int,
+    max_context_length: int,
+    max_prediction_length: int,
+    stride: int,
+    max_windows: int | None = None,
+) -> int:
+    origin_count = estimate_length_sweep_origin_count(
+        series_length=series_length,
+        max_context_length=max_context_length,
+        max_prediction_length=max_prediction_length,
+        stride=stride,
+        max_windows=max_windows,
+    )
+    context_count = max(0, int(max_context_length) - int(min_context_length) + 1)
+    prediction_count = max(0, int(max_prediction_length))
+    return int(origin_count * context_count * prediction_count)
+
+
+def build_length_sweep_summary(run_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if run_metrics_df.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for (context_length, request_length), group in run_metrics_df.groupby(
+        ["context_length", "request_length"],
+        dropna=False,
+    ):
+        row: dict[str, object] = {
+            "context_length": int(context_length),
+            "request_length": int(request_length),
+            "windows": int(group["window_index"].nunique()),
+            "forecast_points": int(group["forecast_points"].sum()),
+        }
+        for metric in METRIC_COLUMNS:
+            row[f"{metric}_mean"] = safe_mean(group[metric])
+            row[f"{metric}_std"] = float(pd.to_numeric(group[metric], errors="coerce").std(ddof=0))
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(["context_length", "request_length"]).reset_index(drop=True)
+
+
+def build_length_sweep_cumulative_metrics(error_detail_df: pd.DataFrame) -> pd.DataFrame:
+    if error_detail_df.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    grouped = error_detail_df.groupby(["context_length", "request_length"], dropna=False)
+    for (context_length, request_length), group in grouped:
+        for horizon_end in range(1, int(request_length) + 1):
+            cumulative_group = group.loc[group["horizon_index"] <= horizon_end]
+            row = {
+                "context_length": int(context_length),
+                "request_length": int(request_length),
+                "horizon_end": int(horizon_end),
+                "horizon_window": f"h+1:h+{int(horizon_end)}",
+            }
+            row.update(summarize_error_metrics(cumulative_group))
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def run_length_sweep_validation(
+    pipeline,
+    context_df: pd.DataFrame,
+    future_df: pd.DataFrame | None,
+    id_column: str,
+    timestamp_column: str,
+    target_column: str,
+    min_context_length: int,
+    max_context_length: int,
+    max_prediction_length: int,
+    stride: int,
+    max_windows: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    min_context_length = int(min_context_length)
+    max_context_length = int(max_context_length)
+    max_prediction_length = int(max_prediction_length)
+    stride = int(stride)
+
+    if min_context_length < VALIDATION_MIN_CONTEXT_LENGTH:
+        raise ValueError(f"길이 Sweep의 최소 과거 길이는 {VALIDATION_MIN_CONTEXT_LENGTH} 이상이어야 합니다.")
+    if max_context_length < min_context_length:
+        raise ValueError("최대 과거 길이는 최소 과거 길이 이상이어야 합니다.")
+    if max_prediction_length < 1:
+        raise ValueError("최대 예측 구간 길이는 1 이상이어야 합니다.")
+    if stride < 1:
+        raise ValueError("윈도우 간격은 1 이상이어야 합니다.")
+
+    prepared = context_df.copy()
+    prepared[timestamp_column] = pd.to_datetime(prepared[timestamp_column], errors="coerce")
+    prepared = prepared.sort_values([id_column, timestamp_column])
+
+    lengths = prepared.groupby(id_column).size()
+    if lengths.empty:
+        raise ValueError("길이 Sweep 검증을 수행할 데이터가 없습니다.")
+
+    common_length = int(lengths.min())
+    required_length = max_context_length + max_prediction_length
+    if common_length < required_length:
+        shortest_id = str(lengths.idxmin())
+        raise ValueError(
+            "선택한 데이터 길이가 부족합니다. "
+            f"현재 선택 구간의 최소 시계열 길이는 {common_length}개(`{shortest_id}`)이고, "
+            f"현재 Sweep 설정은 최소 {required_length}개"
+            f"({max_context_length} history + {max_prediction_length} forecast)가 필요합니다."
+        )
+
+    prepared_future = None
+    if future_df is not None and not future_df.empty:
+        prepared_future = future_df.copy()
+        prepared_future[timestamp_column] = pd.to_datetime(prepared_future[timestamp_column], errors="coerce")
+
+    positions = prepared.groupby(id_column).cumcount()
+    origin_indices = list(range(max_context_length, common_length - max_prediction_length + 1, stride))
+    if max_windows is not None:
+        origin_indices = origin_indices[: int(max_windows)]
+    if not origin_indices:
+        raise ValueError("현재 Sweep 설정으로 생성되는 검증 윈도우가 없습니다.")
+
+    representative_id = str(prepared[id_column].iloc[0])
+    context_lengths = range(min_context_length, max_context_length + 1)
+    request_lengths = range(1, max_prediction_length + 1)
+    run_rows: list[dict[str, object]] = []
+    error_frames: list[pd.DataFrame] = []
+
+    for window_index, origin_idx in enumerate(origin_indices, start=1):
+        for context_length in context_lengths:
+            history_start_idx = origin_idx - context_length
+            model_context = prepared.loc[
+                (positions >= history_start_idx) & (positions < origin_idx)
+            ].copy()
+            history_df = trim_context_to_model_limit(
+                context_df=model_context,
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+            )
+
+            for request_length in request_lengths:
+                future_end_idx = origin_idx + request_length
+                actual_future = prepared.loc[
+                    (positions >= origin_idx) & (positions < future_end_idx)
+                ].copy()
+
+                model_future = None
+                if prepared_future is not None and not prepared_future.empty:
+                    horizon_keys = actual_future[[id_column, timestamp_column]].drop_duplicates()
+                    model_future = prepared_future.merge(horizon_keys, on=[id_column, timestamp_column], how="inner")
+
+                pred_df = run_prediction(
+                    pipeline=pipeline,
+                    context_df=history_df,
+                    future_df=model_future,
+                    prediction_length=request_length,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    target_column=target_column,
+                )
+                error_detail = build_forecast_error_detail(
+                    pred_df=pred_df,
+                    history_df=history_df,
+                    actual_df=actual_future,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    target_column=target_column,
+                )
+                error_detail["window_index"] = int(window_index)
+                error_detail["origin_idx"] = int(origin_idx)
+                error_detail["context_length"] = int(context_length)
+                error_detail["request_length"] = int(request_length)
+                error_detail["history_start_idx"] = int(history_start_idx)
+                error_detail["history_end_idx"] = int(origin_idx - 1)
+                error_frames.append(error_detail)
+
+                ref_future = actual_future.loc[actual_future[id_column].astype(str) == representative_id]
+                metrics = summarize_error_metrics(error_detail)
+                run_rows.append(
+                    {
+                        "window_index": int(window_index),
+                        "origin_idx": int(origin_idx),
+                        "context_length": int(context_length),
+                        "request_length": int(request_length),
+                        "history_start_idx": int(history_start_idx),
+                        "history_end_idx": int(origin_idx - 1),
+                        "forecast_start": str(ref_future[timestamp_column].min()),
+                        "forecast_end": str(ref_future[timestamp_column].max()),
+                        **metrics,
+                    }
+                )
+
+    run_metrics_df = pd.DataFrame(run_rows)
+    error_detail_df = pd.concat(error_frames, ignore_index=True) if error_frames else pd.DataFrame()
+    summary_df = build_length_sweep_summary(run_metrics_df)
+    horizon_metrics_df = aggregate_error_metrics(
+        error_detail_df,
+        ["context_length", "request_length", "horizon_index"],
+    )
+    if not horizon_metrics_df.empty:
+        horizon_metrics_df["horizon_label"] = horizon_metrics_df["horizon_index"].map(lambda value: f"h+{int(value)}")
+    cumulative_metrics_df = build_length_sweep_cumulative_metrics(error_detail_df)
+    return summary_df, run_metrics_df, horizon_metrics_df, cumulative_metrics_df, error_detail_df
+
+
 def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> pd.DataFrame:
-    metric_columns = ["MAE", "RMSE", "MAPE", "MASE", "Correlation"]
     if validation_windows_df.empty or "scenario" not in validation_windows_df.columns:
         return pd.DataFrame()
 
-    grouped = validation_windows_df.groupby("scenario", dropna=False)[metric_columns].mean().reset_index()
+    grouped = validation_windows_df.groupby("scenario", dropna=False)[METRIC_COLUMNS].mean().reset_index()
     if WEEKDAY_BASELINE_SCENARIO not in set(grouped["scenario"]):
         return grouped
 
@@ -1240,7 +1603,7 @@ def build_validation_comparison_summary(validation_windows_df: pd.DataFrame) -> 
         scenario_name = str(scenario_row["scenario"])
         if scenario_name == WEEKDAY_BASELINE_SCENARIO:
             continue
-        for metric in metric_columns:
+        for metric in METRIC_COLUMNS:
             delta = float(scenario_row[metric] - baseline[metric])
             if metric == "Correlation":
                 better = "개선" if delta > 0 else "악화" if delta < 0 else "동일"
@@ -1300,6 +1663,44 @@ def show_validation_cards(summary_df: pd.DataFrame) -> None:
     col4.metric("평균 MASE", f"{float(row['MASE_mean']):.4f}")
 
 
+def build_metric_heatmap(
+    df: pd.DataFrame,
+    x_column: str,
+    y_column: str,
+    value_column: str,
+    x_title: str,
+    y_title: str,
+    color_title: str,
+) -> go.Figure:
+    figure = go.Figure()
+    if df.empty or value_column not in df.columns:
+        figure.update_layout(height=360, margin={"l": 20, "r": 20, "t": 30, "b": 20})
+        return figure
+
+    pivot = (
+        df.pivot_table(index=y_column, columns=x_column, values=value_column, aggfunc="mean")
+        .sort_index()
+        .sort_index(axis=1)
+    )
+    figure.add_trace(
+        go.Heatmap(
+            x=pivot.columns.tolist(),
+            y=pivot.index.tolist(),
+            z=pivot.to_numpy(),
+            colorscale="Viridis",
+            colorbar={"title": color_title},
+            hovertemplate=f"{x_title}: %{{x}}<br>{y_title}: %{{y}}<br>{color_title}: %{{z:.4f}}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        height=420,
+        margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+    )
+    return figure
+
+
 with st.sidebar:
     st.header("빠른 안내")
     st.caption("Forecast, Validation, Covariate Lab 탭에서 실험을 이어갈 수 있습니다.")
@@ -1351,7 +1752,7 @@ with global_settings:
             key="prediction_length_input",
         )
 
-tabs = st.tabs(["Forecast", "Validation", "Covariate Lab"])
+tabs = st.tabs(["Forecast", "Validation", "Length Sweep", "Covariate Lab"])
 
 with tabs[0]:
     st.subheader("Forecast")
@@ -1739,7 +2140,8 @@ with tabs[1]:
     with val_cfg_col1:
         with st.container(border=True):
             st.markdown("**1. 검증 설정**")
-            validation_min_context_length = 8
+            validation_mode = VALIDATION_MODE_FIXED
+            validation_min_context_length = VALIDATION_MIN_CONTEXT_LENGTH
             validation_prediction_max = CHRONOS2_MAX_PREDICTION_LENGTH
             if validation_min_length > 0:
                 validation_prediction_max = min(
@@ -1748,7 +2150,7 @@ with tabs[1]:
                 )
             validation_prediction_default = min(int(prediction_length), int(validation_prediction_max))
             validation_prediction_length = st.number_input(
-                "검증용 예측 구간 길이",
+                "검증용 예측 구간 길이" if validation_mode == VALIDATION_MODE_FIXED else "최대 예측 구간 길이",
                 min_value=1,
                 max_value=int(validation_prediction_max),
                 value=int(validation_prediction_default),
@@ -1765,13 +2167,34 @@ with tabs[1]:
                     ),
                 )
             validation_context_default = min(168, int(validation_context_max))
-            validation_context_length = st.number_input(
-                "검증용 과거 길이",
-                min_value=validation_min_context_length,
-                max_value=int(validation_context_max),
-                value=int(validation_context_default),
-                step=8,
-            )
+            if validation_mode == VALIDATION_MODE_FIXED:
+                sweep_min_context_length = validation_context_default
+                validation_context_length = st.number_input(
+                    "검증용 과거 길이",
+                    min_value=validation_min_context_length,
+                    max_value=int(validation_context_max),
+                    value=int(validation_context_default),
+                    step=8,
+                )
+                sweep_min_context_length = int(validation_context_length)
+            else:
+                sweep_min_context_default = min(validation_min_context_length, int(validation_context_max))
+                sweep_min_context_length = st.number_input(
+                    "최소 과거 길이",
+                    min_value=validation_min_context_length,
+                    max_value=int(validation_context_max),
+                    value=int(sweep_min_context_default),
+                    step=1,
+                    help=f"너무 짧은 context는 불안정해서 기본 최소값은 {VALIDATION_MIN_CONTEXT_LENGTH}입니다.",
+                )
+                validation_context_default = max(int(sweep_min_context_length), int(validation_context_default))
+                validation_context_length = st.number_input(
+                    "최대 과거 길이",
+                    min_value=int(sweep_min_context_length),
+                    max_value=int(validation_context_max),
+                    value=int(validation_context_default),
+                    step=1,
+                )
             validation_stride = st.number_input(
                 "윈도우 간격",
                 min_value=1,
@@ -1789,13 +2212,40 @@ with tabs[1]:
             max_windows = None if int(max_windows_input) == 0 else int(max_windows_input)
 
             validation_required_length = int(validation_context_length) + int(validation_prediction_length)
-            validation_ready = bool(can_run and validation_min_length >= validation_required_length)
-            estimated_validation_windows = estimate_sliding_window_count(
-                series_length=validation_min_length,
-                context_length=int(validation_context_length),
-                prediction_length=int(validation_prediction_length),
-                stride=int(validation_stride),
-                max_windows=max_windows,
+            if validation_mode == VALIDATION_MODE_FIXED:
+                estimated_validation_windows = estimate_sliding_window_count(
+                    series_length=validation_min_length,
+                    context_length=int(validation_context_length),
+                    prediction_length=int(validation_prediction_length),
+                    stride=int(validation_stride),
+                    max_windows=max_windows,
+                )
+                estimated_prediction_calls = int(estimated_validation_windows)
+            else:
+                estimated_validation_windows = estimate_length_sweep_origin_count(
+                    series_length=validation_min_length,
+                    max_context_length=int(validation_context_length),
+                    max_prediction_length=int(validation_prediction_length),
+                    stride=int(validation_stride),
+                    max_windows=max_windows,
+                )
+                estimated_prediction_calls = estimate_length_sweep_call_count(
+                    series_length=validation_min_length,
+                    min_context_length=int(sweep_min_context_length),
+                    max_context_length=int(validation_context_length),
+                    max_prediction_length=int(validation_prediction_length),
+                    stride=int(validation_stride),
+                    max_windows=max_windows,
+                )
+                st.caption(
+                    "Sweep은 같은 forecast origin에 대해 과거 길이 최소~최대와 예측 길이 1~최대를 모두 실행합니다."
+                )
+
+            validation_ready = bool(
+                can_run
+                and validation_min_length >= validation_required_length
+                and estimated_validation_windows > 0
+                and estimated_prediction_calls > 0
             )
             status_col1, status_col2, status_col3 = st.columns(3)
             status_col1.metric("선택 구간 최소 길이", int(validation_min_length))
@@ -1809,109 +2259,162 @@ with tabs[1]:
     with val_cfg_col2:
         with st.container(border=True):
             st.markdown("**2. 비교 옵션**")
-            compare_weekday_covariate = st.checkbox(
-                "요일 공변량 A/B 비교",
-                value=False,
-                help=(
-                    f"timestamp에서 요일을 자동 생성해 `{WEEKDAY_BASELINE_SCENARIO}`와 "
-                    "`曜日-有(인코딩,過去/過去+未来)`를 비교합니다."
-                ),
-            )
-            if compare_weekday_covariate:
-                selected_weekday_encoding = st.selectbox(
-                    "요일 인코딩",
-                    options=list(WEEKDAY_ENCODINGS),
-                    index=0,
-                    help="한 번에 한 가지 인코딩을 고르고, 적용 범위만 3가지 시나리오로 비교합니다.",
+            if validation_mode == VALIDATION_MODE_FIXED:
+                compare_weekday_covariate = st.checkbox(
+                    "요일 공변량 A/B 비교",
+                    value=False,
+                    help=(
+                        f"timestamp에서 요일을 자동 생성해 `{WEEKDAY_BASELINE_SCENARIO}`와 "
+                        "`曜日-有(인코딩,過去/過去+未来)`를 비교합니다."
+                    ),
                 )
-                st.caption(
-                    f"기준선은 `{WEEKDAY_BASELINE_SCENARIO}`이고, 같은 인코딩으로 "
-                    "`過去`와 `過去+未来`를 함께 비교합니다."
-                )
+                if compare_weekday_covariate:
+                    selected_weekday_encoding = st.selectbox(
+                        "요일 인코딩",
+                        options=list(WEEKDAY_ENCODINGS),
+                        index=0,
+                        help="한 번에 한 가지 인코딩을 고르고, 적용 범위만 3가지 시나리오로 비교합니다.",
+                    )
+                    st.caption(
+                        f"기준선은 `{WEEKDAY_BASELINE_SCENARIO}`이고, 같은 인코딩으로 "
+                        "`過去`와 `過去+未来`를 함께 비교합니다."
+                    )
+                else:
+                    st.caption(
+                        "선택하면 기본 검증 외에도 요일 정보를 covariate로 추가한 시나리오를 함께 계산합니다."
+                    )
             else:
-                st.caption(
-                    "선택하면 기본 검증 외에도 요일 정보를 covariate로 추가한 시나리오를 함께 계산합니다."
-                )
+                compare_weekday_covariate = False
+                st.caption("길이 Sweep에서는 context/request length 효과만 분리해서 봅니다.")
 
     validation_can_run = bool(can_run and validation_ready)
 
-    if st.button("슬라이딩 윈도우 검증 실행", type="primary", disabled=not validation_can_run):
+    validation_button_label = (
+        "슬라이딩 윈도우 검증 실행"
+        if validation_mode == VALIDATION_MODE_FIXED
+        else "길이 Sweep 검증 실행"
+    )
+    if st.button(validation_button_label, type="primary", disabled=not validation_can_run):
         try:
-            with st.spinner("슬라이딩 윈도우 검증을 수행하는 중입니다..."):
+            spinner_message = (
+                "슬라이딩 윈도우 검증을 수행하는 중입니다..."
+                if validation_mode == VALIDATION_MODE_FIXED
+                else "Context/Prediction 길이 Sweep 검증을 수행하는 중입니다..."
+            )
+            with st.spinner(spinner_message):
                 pipeline = get_pipeline(model_id, device)
-                summary_df, windows_df, validation_history_df, validation_pred_df, validation_actual_df = run_sliding_window_validation(
-                    pipeline=pipeline,
-                    context_df=context_df,
-                    future_df=future_df,
-                    id_column=id_column,
-                    timestamp_column=timestamp_column,
-                    target_column=target_column,
-                    context_length=int(validation_context_length),
-                    prediction_length=int(validation_prediction_length),
-                    stride=int(validation_stride),
-                    max_windows=max_windows,
-                )
-                summary_df = summary_df.copy()
-                windows_df = windows_df.copy()
-                validation_history_df = validation_history_df.copy()
-                validation_pred_df = validation_pred_df.copy()
-                validation_actual_df = validation_actual_df.copy()
-                summary_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
-                windows_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
-                validation_history_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
-                validation_pred_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
-                validation_actual_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                if validation_mode == VALIDATION_MODE_FIXED:
+                    summary_df, windows_df, validation_history_df, validation_pred_df, validation_actual_df = run_sliding_window_validation(
+                        pipeline=pipeline,
+                        context_df=context_df,
+                        future_df=future_df,
+                        id_column=id_column,
+                        timestamp_column=timestamp_column,
+                        target_column=target_column,
+                        context_length=int(validation_context_length),
+                        prediction_length=int(validation_prediction_length),
+                        stride=int(validation_stride),
+                        max_windows=max_windows,
+                    )
+                    summary_df = summary_df.copy()
+                    windows_df = windows_df.copy()
+                    validation_history_df = validation_history_df.copy()
+                    validation_pred_df = validation_pred_df.copy()
+                    validation_actual_df = validation_actual_df.copy()
+                    summary_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                    windows_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                    validation_history_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                    validation_pred_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
+                    validation_actual_df["scenario"] = WEEKDAY_BASELINE_SCENARIO
 
-                comparison_summary_df = pd.DataFrame()
-                if compare_weekday_covariate:
-                    for _, include_future_covariate in WEEKDAY_COVARIATE_SCOPES:
-                        scenario_name = build_weekday_scenario_name(
-                            selected_weekday_encoding,
-                            include_future_covariate,
-                        )
-                        weekday_context_df, weekday_future_df = build_weekday_covariate_frames(
-                            context_df=context_df,
-                            future_df=future_df,
-                            id_column=id_column,
-                            timestamp_column=timestamp_column,
-                            encoding=selected_weekday_encoding,
-                            include_future_covariate=include_future_covariate,
-                        )
-                        weekday_summary_df, weekday_windows_df, weekday_history_df, weekday_pred_df, weekday_actual_df = run_sliding_window_validation(
-                            pipeline=pipeline,
-                            context_df=weekday_context_df,
-                            future_df=weekday_future_df,
-                            id_column=id_column,
-                            timestamp_column=timestamp_column,
-                            target_column=target_column,
-                            context_length=int(validation_context_length),
-                            prediction_length=int(validation_prediction_length),
-                            stride=int(validation_stride),
-                            max_windows=max_windows,
-                        )
-                        weekday_summary_df = weekday_summary_df.copy()
-                        weekday_windows_df = weekday_windows_df.copy()
-                        weekday_history_df = weekday_history_df.copy()
-                        weekday_pred_df = weekday_pred_df.copy()
-                        weekday_actual_df = weekday_actual_df.copy()
-                        weekday_summary_df["scenario"] = scenario_name
-                        weekday_windows_df["scenario"] = scenario_name
-                        weekday_history_df["scenario"] = scenario_name
-                        weekday_pred_df["scenario"] = scenario_name
-                        weekday_actual_df["scenario"] = scenario_name
-                        summary_df = pd.concat([summary_df, weekday_summary_df], ignore_index=True)
-                        windows_df = pd.concat([windows_df, weekday_windows_df], ignore_index=True)
-                        validation_history_df = pd.concat([validation_history_df, weekday_history_df], ignore_index=True)
-                        validation_pred_df = pd.concat([validation_pred_df, weekday_pred_df], ignore_index=True)
-                        validation_actual_df = pd.concat([validation_actual_df, weekday_actual_df], ignore_index=True)
-                    comparison_summary_df = build_validation_comparison_summary(windows_df)
+                    comparison_summary_df = pd.DataFrame()
+                    if compare_weekday_covariate:
+                        for _, include_future_covariate in WEEKDAY_COVARIATE_SCOPES:
+                            scenario_name = build_weekday_scenario_name(
+                                selected_weekday_encoding,
+                                include_future_covariate,
+                            )
+                            weekday_context_df, weekday_future_df = build_weekday_covariate_frames(
+                                context_df=context_df,
+                                future_df=future_df,
+                                id_column=id_column,
+                                timestamp_column=timestamp_column,
+                                encoding=selected_weekday_encoding,
+                                include_future_covariate=include_future_covariate,
+                            )
+                            weekday_summary_df, weekday_windows_df, weekday_history_df, weekday_pred_df, weekday_actual_df = run_sliding_window_validation(
+                                pipeline=pipeline,
+                                context_df=weekday_context_df,
+                                future_df=weekday_future_df,
+                                id_column=id_column,
+                                timestamp_column=timestamp_column,
+                                target_column=target_column,
+                                context_length=int(validation_context_length),
+                                prediction_length=int(validation_prediction_length),
+                                stride=int(validation_stride),
+                                max_windows=max_windows,
+                            )
+                            weekday_summary_df = weekday_summary_df.copy()
+                            weekday_windows_df = weekday_windows_df.copy()
+                            weekday_history_df = weekday_history_df.copy()
+                            weekday_pred_df = weekday_pred_df.copy()
+                            weekday_actual_df = weekday_actual_df.copy()
+                            weekday_summary_df["scenario"] = scenario_name
+                            weekday_windows_df["scenario"] = scenario_name
+                            weekday_history_df["scenario"] = scenario_name
+                            weekday_pred_df["scenario"] = scenario_name
+                            weekday_actual_df["scenario"] = scenario_name
+                            summary_df = pd.concat([summary_df, weekday_summary_df], ignore_index=True)
+                            windows_df = pd.concat([windows_df, weekday_windows_df], ignore_index=True)
+                            validation_history_df = pd.concat([validation_history_df, weekday_history_df], ignore_index=True)
+                            validation_pred_df = pd.concat([validation_pred_df, weekday_pred_df], ignore_index=True)
+                            validation_actual_df = pd.concat([validation_actual_df, weekday_actual_df], ignore_index=True)
+                        comparison_summary_df = build_validation_comparison_summary(windows_df)
 
-                st.session_state["validation_summary_df"] = summary_df
-                st.session_state["validation_windows_df"] = windows_df
-                st.session_state["validation_comparison_summary_df"] = comparison_summary_df
-                st.session_state["validation_history_detail_df"] = validation_history_df
-                st.session_state["validation_pred_detail_df"] = validation_pred_df
-                st.session_state["validation_actual_detail_df"] = validation_actual_df
+                    st.session_state["validation_summary_df"] = summary_df
+                    st.session_state["validation_windows_df"] = windows_df
+                    st.session_state["validation_comparison_summary_df"] = comparison_summary_df
+                    st.session_state["validation_history_detail_df"] = validation_history_df
+                    st.session_state["validation_pred_detail_df"] = validation_pred_df
+                    st.session_state["validation_actual_detail_df"] = validation_actual_df
+                    st.session_state["validation_sweep_summary_df"] = None
+                    st.session_state["validation_sweep_run_metrics_df"] = None
+                    st.session_state["validation_sweep_horizon_metrics_df"] = None
+                    st.session_state["validation_sweep_cumulative_metrics_df"] = None
+                    st.session_state["validation_sweep_error_detail_df"] = None
+                else:
+                    (
+                        sweep_summary_df,
+                        sweep_run_metrics_df,
+                        sweep_horizon_metrics_df,
+                        sweep_cumulative_metrics_df,
+                        sweep_error_detail_df,
+                    ) = run_length_sweep_validation(
+                        pipeline=pipeline,
+                        context_df=context_df,
+                        future_df=future_df,
+                        id_column=id_column,
+                        timestamp_column=timestamp_column,
+                        target_column=target_column,
+                        min_context_length=int(sweep_min_context_length),
+                        max_context_length=int(validation_context_length),
+                        max_prediction_length=int(validation_prediction_length),
+                        stride=int(validation_stride),
+                        max_windows=max_windows,
+                    )
+                    st.session_state["validation_sweep_summary_df"] = sweep_summary_df
+                    st.session_state["validation_sweep_run_metrics_df"] = sweep_run_metrics_df
+                    st.session_state["validation_sweep_horizon_metrics_df"] = sweep_horizon_metrics_df
+                    st.session_state["validation_sweep_cumulative_metrics_df"] = sweep_cumulative_metrics_df
+                    st.session_state["validation_sweep_error_detail_df"] = sweep_error_detail_df
+                    st.session_state["validation_summary_df"] = None
+                    st.session_state["validation_windows_df"] = None
+                    st.session_state["validation_comparison_summary_df"] = None
+                    st.session_state["validation_history_detail_df"] = None
+                    st.session_state["validation_pred_detail_df"] = None
+                    st.session_state["validation_actual_detail_df"] = None
+
+                st.session_state["validation_result_mode"] = validation_mode
             st.success("자동 검증이 완료되었습니다.")
         except Exception as exc:
             st.error(f"자동 검증 중 오류가 발생했습니다: {exc}")
@@ -1922,8 +2425,152 @@ with tabs[1]:
     validation_history_detail_df = st.session_state.get("validation_history_detail_df")
     validation_pred_detail_df = st.session_state.get("validation_pred_detail_df")
     validation_actual_detail_df = st.session_state.get("validation_actual_detail_df")
+    validation_result_mode = VALIDATION_MODE_FIXED
+    validation_sweep_summary_df = st.session_state.get("validation_sweep_summary_df")
+    validation_sweep_run_metrics_df = st.session_state.get("validation_sweep_run_metrics_df")
+    validation_sweep_horizon_metrics_df = st.session_state.get("validation_sweep_horizon_metrics_df")
+    validation_sweep_cumulative_metrics_df = st.session_state.get("validation_sweep_cumulative_metrics_df")
+    validation_sweep_error_detail_df = st.session_state.get("validation_sweep_error_detail_df")
 
-    if isinstance(validation_summary_df, pd.DataFrame) and not validation_summary_df.empty:
+    if (
+        validation_result_mode == VALIDATION_MODE_LENGTH_SWEEP
+        and isinstance(validation_sweep_summary_df, pd.DataFrame)
+        and not validation_sweep_summary_df.empty
+    ):
+        with st.container(border=True):
+            st.markdown("**길이 Sweep 요약**")
+            sweep_total_calls = (
+                int(len(validation_sweep_run_metrics_df))
+                if isinstance(validation_sweep_run_metrics_df, pd.DataFrame)
+                else 0
+            )
+            sweep_context_count = int(validation_sweep_summary_df["context_length"].nunique())
+            sweep_request_count = int(validation_sweep_summary_df["request_length"].nunique())
+            sweep_origin_count = (
+                int(validation_sweep_run_metrics_df["window_index"].nunique())
+                if isinstance(validation_sweep_run_metrics_df, pd.DataFrame)
+                and not validation_sweep_run_metrics_df.empty
+                else 0
+            )
+            sweep_col1, sweep_col2, sweep_col3, sweep_col4 = st.columns(4)
+            sweep_col1.metric("예측 호출", sweep_total_calls)
+            sweep_col2.metric("origin/window", sweep_origin_count)
+            sweep_col3.metric("context 길이 수", sweep_context_count)
+            sweep_col4.metric("request 길이 수", sweep_request_count)
+
+            sweep_metric = st.selectbox(
+                "Sweep 지표",
+                options=METRIC_COLUMNS,
+                index=0,
+                key="validation_sweep_metric",
+            )
+            sweep_metric_column = f"{sweep_metric}_mean"
+            sweep_heatmap = build_metric_heatmap(
+                df=validation_sweep_summary_df,
+                x_column="request_length",
+                y_column="context_length",
+                value_column=sweep_metric_column,
+                x_title="request_length",
+                y_title="context_length",
+                color_title=sweep_metric,
+            )
+            st.plotly_chart(sweep_heatmap, use_container_width=True)
+            st.dataframe(validation_sweep_summary_df, use_container_width=True)
+
+        if (
+            isinstance(validation_sweep_horizon_metrics_df, pd.DataFrame)
+            and not validation_sweep_horizon_metrics_df.empty
+        ):
+            with st.container(border=True):
+                st.markdown("**요청 길이별 Horizon 성능**")
+                context_options = sorted(
+                    validation_sweep_horizon_metrics_df["context_length"].dropna().astype(int).unique().tolist()
+                )
+                selected_sweep_context = st.selectbox(
+                    "확인할 context_length",
+                    options=context_options,
+                    index=len(context_options) - 1,
+                    key="validation_sweep_context_for_horizon",
+                )
+                context_horizon_df = validation_sweep_horizon_metrics_df.loc[
+                    validation_sweep_horizon_metrics_df["context_length"].astype(int) == int(selected_sweep_context)
+                ].copy()
+                horizon_heatmap = build_metric_heatmap(
+                    df=context_horizon_df,
+                    x_column="horizon_index",
+                    y_column="request_length",
+                    value_column=sweep_metric,
+                    x_title="horizon_index",
+                    y_title="request_length",
+                    color_title=sweep_metric,
+                )
+                st.plotly_chart(horizon_heatmap, use_container_width=True)
+                st.dataframe(context_horizon_df, use_container_width=True)
+
+        if (
+            isinstance(validation_sweep_cumulative_metrics_df, pd.DataFrame)
+            and not validation_sweep_cumulative_metrics_df.empty
+        ):
+            with st.container(border=True):
+                st.markdown("**누적 1:k 성능**")
+                cumulative_context_options = sorted(
+                    validation_sweep_cumulative_metrics_df["context_length"].dropna().astype(int).unique().tolist()
+                )
+                cumulative_request_options = sorted(
+                    validation_sweep_cumulative_metrics_df["request_length"].dropna().astype(int).unique().tolist()
+                )
+                cum_col1, cum_col2 = st.columns(2)
+                selected_cumulative_context = cum_col1.selectbox(
+                    "누적 context_length",
+                    options=cumulative_context_options,
+                    index=len(cumulative_context_options) - 1,
+                    key="validation_sweep_cumulative_context",
+                )
+                selected_cumulative_request = cum_col2.selectbox(
+                    "누적 request_length",
+                    options=cumulative_request_options,
+                    index=len(cumulative_request_options) - 1,
+                    key="validation_sweep_cumulative_request",
+                )
+                cumulative_view_df = validation_sweep_cumulative_metrics_df.loc[
+                    (validation_sweep_cumulative_metrics_df["context_length"].astype(int) == int(selected_cumulative_context))
+                    & (
+                        validation_sweep_cumulative_metrics_df["request_length"].astype(int)
+                        == int(selected_cumulative_request)
+                    )
+                ].copy()
+                cumulative_fig = go.Figure()
+                cumulative_fig.add_trace(
+                    go.Scatter(
+                        x=cumulative_view_df["horizon_end"],
+                        y=cumulative_view_df[sweep_metric],
+                        mode="lines+markers",
+                        name=sweep_metric,
+                        line={"color": "#1d3557", "width": 2},
+                    )
+                )
+                cumulative_fig.update_layout(
+                    height=360,
+                    margin={"l": 20, "r": 20, "t": 30, "b": 20},
+                    xaxis_title="horizon_end",
+                    yaxis_title=sweep_metric,
+                )
+                st.plotly_chart(cumulative_fig, use_container_width=True)
+                st.dataframe(cumulative_view_df, use_container_width=True)
+
+        if (
+            isinstance(validation_sweep_error_detail_df, pd.DataFrame)
+            and not validation_sweep_error_detail_df.empty
+        ):
+            with st.container(border=True):
+                st.markdown("**Sweep 상세 오차 샘플**")
+                st.dataframe(validation_sweep_error_detail_df.head(200), use_container_width=True)
+
+    if (
+        validation_result_mode == VALIDATION_MODE_FIXED
+        and isinstance(validation_summary_df, pd.DataFrame)
+        and not validation_summary_df.empty
+    ):
         with st.container(border=True):
             st.markdown("**검증 요약**")
             base_summary_df = validation_summary_df.loc[
@@ -1933,7 +2580,11 @@ with tabs[1]:
                 show_validation_cards(base_summary_df)
             st.dataframe(validation_summary_df, use_container_width=True)
 
-    if isinstance(validation_windows_df, pd.DataFrame) and not validation_windows_df.empty:
+    if (
+        validation_result_mode == VALIDATION_MODE_FIXED
+        and isinstance(validation_windows_df, pd.DataFrame)
+        and not validation_windows_df.empty
+    ):
         with st.container(border=True):
             st.markdown("**지표 추이**")
             metric_for_plot = st.selectbox(
@@ -1972,19 +2623,22 @@ with tabs[1]:
             )
             st.plotly_chart(trend_fig, use_container_width=True)
 
-    detail_col1, detail_col2 = st.columns([0.9, 1.2])
-    with detail_col1:
-        if isinstance(validation_comparison_summary_df, pd.DataFrame) and not validation_comparison_summary_df.empty:
-            with st.container(border=True):
-                st.markdown("**요일 공변량 비교**")
-                st.dataframe(validation_comparison_summary_df, use_container_width=True)
-    with detail_col2:
-        if isinstance(validation_windows_df, pd.DataFrame) and not validation_windows_df.empty:
-            with st.container(border=True):
-                st.markdown("**윈도우별 검증 결과**")
-                st.dataframe(validation_windows_df, use_container_width=True)
+    if validation_result_mode == VALIDATION_MODE_FIXED:
+        detail_col1, detail_col2 = st.columns([0.9, 1.2])
+        with detail_col1:
+            if isinstance(validation_comparison_summary_df, pd.DataFrame) and not validation_comparison_summary_df.empty:
+                with st.container(border=True):
+                    st.markdown("**요일 공변량 비교**")
+                    st.dataframe(validation_comparison_summary_df, use_container_width=True)
+        with detail_col2:
+            if isinstance(validation_windows_df, pd.DataFrame) and not validation_windows_df.empty:
+                with st.container(border=True):
+                    st.markdown("**윈도우별 검증 결과**")
+                    st.dataframe(validation_windows_df, use_container_width=True)
 
     if (
+        validation_result_mode == VALIDATION_MODE_FIXED
+        and
         isinstance(validation_history_detail_df, pd.DataFrame)
         and not validation_history_detail_df.empty
         and isinstance(validation_pred_detail_df, pd.DataFrame)
@@ -2045,6 +2699,299 @@ with tabs[1]:
             st.plotly_chart(preview_figure, use_container_width=True)
 
 with tabs[2]:
+    st.subheader("Length Sweep")
+    st.caption("같은 forecast origin에서 context 길이와 prediction 요청 길이를 바꿔 Chronos-2 성능 변화를 확인합니다.")
+
+    show_top_status(
+        context_df=context_df,
+        prediction_length=int(prediction_length),
+        device=device,
+        id_column=id_column,
+        timestamp_column=timestamp_column,
+    )
+
+    sweep_lengths = pd.Series(dtype="int64")
+    sweep_min_length = 0
+    if can_run and id_column and timestamp_column:
+        sweep_lengths = get_series_lengths(
+            context_df,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+        )
+        if not sweep_lengths.empty:
+            sweep_min_length = int(sweep_lengths.min())
+
+    sweep_cfg_col1, sweep_cfg_col2 = st.columns([1.05, 0.95])
+    with sweep_cfg_col1:
+        with st.container(border=True):
+            st.markdown("**1. Sweep 설정**")
+            sweep_prediction_max = CHRONOS2_MAX_PREDICTION_LENGTH
+            if sweep_min_length > 0:
+                sweep_prediction_max = min(
+                    CHRONOS2_MAX_PREDICTION_LENGTH,
+                    max(1, sweep_min_length - VALIDATION_MIN_CONTEXT_LENGTH),
+                )
+            sweep_prediction_default = min(int(prediction_length), int(sweep_prediction_max))
+            sweep_prediction_length = st.number_input(
+                "최대 예측 구간 길이",
+                min_value=1,
+                max_value=int(sweep_prediction_max),
+                value=int(sweep_prediction_default),
+                step=1,
+                key="length_sweep_prediction_length",
+            )
+
+            sweep_context_max = CHRONOS2_MAX_CONTEXT_LENGTH
+            if sweep_min_length > 0:
+                sweep_context_max = min(
+                    CHRONOS2_MAX_CONTEXT_LENGTH,
+                    max(
+                        VALIDATION_MIN_CONTEXT_LENGTH,
+                        sweep_min_length - int(sweep_prediction_length),
+                    ),
+                )
+            sweep_min_context_length = st.number_input(
+                "최소 과거 길이",
+                min_value=VALIDATION_MIN_CONTEXT_LENGTH,
+                max_value=int(sweep_context_max),
+                value=VALIDATION_MIN_CONTEXT_LENGTH,
+                step=1,
+                key="length_sweep_min_context_length",
+                help=f"너무 짧은 context는 불안정해서 기본 최소값은 {VALIDATION_MIN_CONTEXT_LENGTH}입니다.",
+            )
+            sweep_context_default = max(int(sweep_min_context_length), min(168, int(sweep_context_max)))
+            sweep_context_length = st.number_input(
+                "최대 과거 길이",
+                min_value=int(sweep_min_context_length),
+                max_value=int(sweep_context_max),
+                value=int(sweep_context_default),
+                step=1,
+                key="length_sweep_context_length",
+            )
+            sweep_stride = st.number_input(
+                "윈도우 간격",
+                min_value=1,
+                max_value=CHRONOS2_MAX_CONTEXT_LENGTH,
+                value=1,
+                step=1,
+                key="length_sweep_stride",
+            )
+            sweep_max_windows_input = st.number_input(
+                "최대 윈도우 수 (0이면 전체)",
+                min_value=0,
+                max_value=10000,
+                value=0,
+                step=1,
+                key="length_sweep_max_windows",
+            )
+            sweep_max_windows = None if int(sweep_max_windows_input) == 0 else int(sweep_max_windows_input)
+
+    sweep_required_length = int(sweep_context_length) + int(sweep_prediction_length)
+    estimated_sweep_windows = estimate_length_sweep_origin_count(
+        series_length=sweep_min_length,
+        max_context_length=int(sweep_context_length),
+        max_prediction_length=int(sweep_prediction_length),
+        stride=int(sweep_stride),
+        max_windows=sweep_max_windows,
+    )
+    estimated_sweep_calls = estimate_length_sweep_call_count(
+        series_length=sweep_min_length,
+        min_context_length=int(sweep_min_context_length),
+        max_context_length=int(sweep_context_length),
+        max_prediction_length=int(sweep_prediction_length),
+        stride=int(sweep_stride),
+        max_windows=sweep_max_windows,
+    )
+    sweep_ready = bool(
+        can_run
+        and sweep_min_length >= sweep_required_length
+        and estimated_sweep_windows > 0
+        and estimated_sweep_calls > 0
+    )
+
+    with sweep_cfg_col2:
+        with st.container(border=True):
+            st.markdown("**2. 실행 규모**")
+            st.caption(
+                "각 forecast origin마다 context_length 최소~최대, request_length 1~최대를 모두 실행합니다."
+            )
+            sweep_status_col1, sweep_status_col2 = st.columns(2)
+            sweep_status_col1.metric("선택 구간 최소 길이", int(sweep_min_length))
+            sweep_status_col2.metric("필요 길이", int(sweep_required_length))
+            sweep_status_col3, sweep_status_col4 = st.columns(2)
+            sweep_status_col3.metric("예상 윈도우 수", int(estimated_sweep_windows))
+            sweep_status_col4.metric("예상 예측 호출", int(estimated_sweep_calls))
+            if can_run and not sweep_ready:
+                st.warning("선택 구간을 늘리거나 최대 과거/예측 길이를 줄여주세요.")
+            if estimated_sweep_calls > 1000:
+                st.warning("예측 호출 수가 많습니다. 실행 시간이 길면 최대 윈도우 수나 최대 길이를 줄여주세요.")
+
+    if st.button("길이 Sweep 검증 실행", type="primary", disabled=not sweep_ready):
+        try:
+            with st.spinner("Context/Prediction 길이 Sweep 검증을 수행하는 중입니다..."):
+                pipeline = get_pipeline(model_id, device)
+                (
+                    sweep_summary_df,
+                    sweep_run_metrics_df,
+                    sweep_horizon_metrics_df,
+                    sweep_cumulative_metrics_df,
+                    sweep_error_detail_df,
+                ) = run_length_sweep_validation(
+                    pipeline=pipeline,
+                    context_df=context_df,
+                    future_df=future_df,
+                    id_column=id_column,
+                    timestamp_column=timestamp_column,
+                    target_column=target_column,
+                    min_context_length=int(sweep_min_context_length),
+                    max_context_length=int(sweep_context_length),
+                    max_prediction_length=int(sweep_prediction_length),
+                    stride=int(sweep_stride),
+                    max_windows=sweep_max_windows,
+                )
+                st.session_state["length_sweep_summary_df"] = sweep_summary_df
+                st.session_state["length_sweep_run_metrics_df"] = sweep_run_metrics_df
+                st.session_state["length_sweep_horizon_metrics_df"] = sweep_horizon_metrics_df
+                st.session_state["length_sweep_cumulative_metrics_df"] = sweep_cumulative_metrics_df
+                st.session_state["length_sweep_error_detail_df"] = sweep_error_detail_df
+            st.success("길이 Sweep 검증이 완료되었습니다.")
+        except Exception as exc:
+            st.error(f"길이 Sweep 검증 중 오류가 발생했습니다: {exc}")
+
+    length_sweep_summary_df = st.session_state.get("length_sweep_summary_df")
+    length_sweep_run_metrics_df = st.session_state.get("length_sweep_run_metrics_df")
+    length_sweep_horizon_metrics_df = st.session_state.get("length_sweep_horizon_metrics_df")
+    length_sweep_cumulative_metrics_df = st.session_state.get("length_sweep_cumulative_metrics_df")
+    length_sweep_error_detail_df = st.session_state.get("length_sweep_error_detail_df")
+
+    if isinstance(length_sweep_summary_df, pd.DataFrame) and not length_sweep_summary_df.empty:
+        with st.container(border=True):
+            st.markdown("**길이 Sweep 요약**")
+            sweep_total_calls = (
+                int(len(length_sweep_run_metrics_df))
+                if isinstance(length_sweep_run_metrics_df, pd.DataFrame)
+                else 0
+            )
+            sweep_context_count = int(length_sweep_summary_df["context_length"].nunique())
+            sweep_request_count = int(length_sweep_summary_df["request_length"].nunique())
+            sweep_origin_count = (
+                int(length_sweep_run_metrics_df["window_index"].nunique())
+                if isinstance(length_sweep_run_metrics_df, pd.DataFrame)
+                and not length_sweep_run_metrics_df.empty
+                else 0
+            )
+            summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+            summary_col1.metric("예측 호출", sweep_total_calls)
+            summary_col2.metric("origin/window", sweep_origin_count)
+            summary_col3.metric("context 길이 수", sweep_context_count)
+            summary_col4.metric("request 길이 수", sweep_request_count)
+
+            sweep_metric = st.selectbox(
+                "Sweep 지표",
+                options=METRIC_COLUMNS,
+                index=0,
+                key="length_sweep_metric",
+            )
+            sweep_metric_column = f"{sweep_metric}_mean"
+            sweep_heatmap = build_metric_heatmap(
+                df=length_sweep_summary_df,
+                x_column="request_length",
+                y_column="context_length",
+                value_column=sweep_metric_column,
+                x_title="request_length",
+                y_title="context_length",
+                color_title=sweep_metric,
+            )
+            st.plotly_chart(sweep_heatmap, use_container_width=True)
+            st.dataframe(length_sweep_summary_df, use_container_width=True)
+
+        if (
+            isinstance(length_sweep_horizon_metrics_df, pd.DataFrame)
+            and not length_sweep_horizon_metrics_df.empty
+        ):
+            with st.container(border=True):
+                st.markdown("**요청 길이별 Horizon 성능**")
+                context_options = sorted(
+                    length_sweep_horizon_metrics_df["context_length"].dropna().astype(int).unique().tolist()
+                )
+                selected_sweep_context = st.selectbox(
+                    "확인할 context_length",
+                    options=context_options,
+                    index=len(context_options) - 1,
+                    key="length_sweep_context_for_horizon",
+                )
+                context_horizon_df = length_sweep_horizon_metrics_df.loc[
+                    length_sweep_horizon_metrics_df["context_length"].astype(int) == int(selected_sweep_context)
+                ].copy()
+                horizon_heatmap = build_metric_heatmap(
+                    df=context_horizon_df,
+                    x_column="horizon_index",
+                    y_column="request_length",
+                    value_column=sweep_metric,
+                    x_title="horizon_index",
+                    y_title="request_length",
+                    color_title=sweep_metric,
+                )
+                st.plotly_chart(horizon_heatmap, use_container_width=True)
+                st.dataframe(context_horizon_df, use_container_width=True)
+
+        if (
+            isinstance(length_sweep_cumulative_metrics_df, pd.DataFrame)
+            and not length_sweep_cumulative_metrics_df.empty
+        ):
+            with st.container(border=True):
+                st.markdown("**누적 1:k 성능**")
+                cumulative_context_options = sorted(
+                    length_sweep_cumulative_metrics_df["context_length"].dropna().astype(int).unique().tolist()
+                )
+                cumulative_request_options = sorted(
+                    length_sweep_cumulative_metrics_df["request_length"].dropna().astype(int).unique().tolist()
+                )
+                cum_col1, cum_col2 = st.columns(2)
+                selected_cumulative_context = cum_col1.selectbox(
+                    "누적 context_length",
+                    options=cumulative_context_options,
+                    index=len(cumulative_context_options) - 1,
+                    key="length_sweep_cumulative_context",
+                )
+                selected_cumulative_request = cum_col2.selectbox(
+                    "누적 request_length",
+                    options=cumulative_request_options,
+                    index=len(cumulative_request_options) - 1,
+                    key="length_sweep_cumulative_request",
+                )
+                cumulative_view_df = length_sweep_cumulative_metrics_df.loc[
+                    (length_sweep_cumulative_metrics_df["context_length"].astype(int) == int(selected_cumulative_context))
+                    & (
+                        length_sweep_cumulative_metrics_df["request_length"].astype(int)
+                        == int(selected_cumulative_request)
+                    )
+                ].copy()
+                cumulative_fig = go.Figure()
+                cumulative_fig.add_trace(
+                    go.Scatter(
+                        x=cumulative_view_df["horizon_end"],
+                        y=cumulative_view_df[sweep_metric],
+                        mode="lines+markers",
+                        name=sweep_metric,
+                        line={"color": "#1d3557", "width": 2},
+                    )
+                )
+                cumulative_fig.update_layout(
+                    height=360,
+                    margin={"l": 20, "r": 20, "t": 30, "b": 20},
+                    xaxis_title="horizon_end",
+                    yaxis_title=sweep_metric,
+                )
+                st.plotly_chart(cumulative_fig, use_container_width=True)
+                st.dataframe(cumulative_view_df, use_container_width=True)
+
+        if isinstance(length_sweep_error_detail_df, pd.DataFrame) and not length_sweep_error_detail_df.empty:
+            with st.container(border=True):
+                st.markdown("**Sweep 상세 오차 샘플**")
+                st.dataframe(length_sweep_error_detail_df.head(200), use_container_width=True)
+
+with tabs[3]:
     st.subheader("Covariate Lab")
     st.caption("선택한 입력 구간을 perturb해서 예측 민감도와 attention-like influence를 확인합니다.")
 
